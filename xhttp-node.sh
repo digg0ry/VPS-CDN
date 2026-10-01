@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.2.1"
 STATE_DIR="/opt/xhttp-node"
 STATE_FILE="$STATE_DIR/state.env"
 WEBROOT="$STATE_DIR/www"
@@ -10,8 +10,11 @@ EXPORT_DIR="$STATE_DIR/exports"
 CERT_DIR="$STATE_DIR/certs"
 NGINX_SITE="/etc/nginx/sites-available/xhttp-node.conf"
 NGINX_LINK="/etc/nginx/sites-enabled/xhttp-node.conf"
+NGINX_SNIPPET="/etc/nginx/snippets/xhttp-node-proxy.conf"
+SYSTEMD_DIR="/etc/systemd/system"
 WATCHDOG_BIN="/usr/local/sbin/node-ram-watchdog"
 CERT_SYNC_BIN="/usr/local/sbin/xhttp-node-cert-sync"
+NGINX_RECOVER_BIN="/usr/local/sbin/xhttp-node-nginx-recover"
 BACKUP_ROOT="/var/backups/xhttp-node"
 DEFAULT_PATH="/api/v4/telemetry/collect/"
 DEFAULT_XHTTP_PORT="7443"
@@ -160,6 +163,8 @@ check_inputs() {
   valid_domain "$ORIGIN_HOST" || die "Origin Host/SNI không hợp lệ: $ORIGIN_HOST"
   valid_port "$XHTTP_PORT" || die "XHTTP port không hợp lệ: $XHTTP_PORT"
   valid_port "$NODE_PORT" || die "Node API port không hợp lệ: $NODE_PORT"
+  (( XHTTP_PORT != 80 && XHTTP_PORT != 443 && XHTTP_PORT != NODE_PORT )) || die "Cổng XHTTP phải khác 80, 443 và Node API; dùng 7443 trên script và panel."
+  (( NODE_PORT != 80 && NODE_PORT != 443 )) || die "Node API không được dùng cổng 80/443 của Nginx."
   [[ "$RAM_THRESHOLD" =~ ^[0-9]+$ ]] && (( RAM_THRESHOLD >= 50 && RAM_THRESHOLD <= 99 )) || die "RAM threshold phải từ 50 đến 99"
   [[ "$COOLDOWN" =~ ^[0-9]+$ ]] && (( COOLDOWN >= 60 )) || die "Cooldown phải >= 60 giây"
   normalize_path
@@ -169,8 +174,9 @@ install_packages() {
   command_exists apt-get || die "Script cần Ubuntu/Debian có apt-get"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y nginx curl ca-certificates openssl jq dnsutils logrotate
-  systemctl enable --now nginx
+  apt-get install -y nginx curl ca-certificates openssl jq dnsutils logrotate iproute2
+  # Start Nginx after managed config is written; XHTTP may still occupy 443.
+  systemctl enable nginx
 }
 
 install_docker() {
@@ -363,18 +369,61 @@ proxy_location() {
   cat <<EOF
     location = ${XHTTP_PATH%/} {
         proxy_pass http://127.0.0.1:$XHTTP_PORT;
-        include /etc/nginx/snippets/xhttp-node-proxy.conf;
+        include $NGINX_SNIPPET;
     }
     location ^~ $XHTTP_PATH {
         proxy_pass http://127.0.0.1:$XHTTP_PORT;
-        include /etc/nginx/snippets/xhttp-node-proxy.conf;
+        include $NGINX_SNIPPET;
     }
 EOF
 }
 
+nginx_ports_available() {
+  local listeners line
+  listeners="$(ss -H -ltnp '( sport = :80 or sport = :443 )')" || return 1
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # Unknown owners also block startup; never kill another service.
+    if [[ "$line" != *'("nginx",'* ]]; then
+      warn "TCP 80/443 có listener không thuộc Nginx: $line"
+      return 1
+    fi
+  done <<< "$listeners"
+}
+
+apply_nginx_service() {
+  nginx_ports_available || return 1
+  nginx -t || return 1
+  if systemctl is-active --quiet nginx; then
+    systemctl reload nginx || return 1
+  else
+    systemctl start nginx || return 1
+  fi
+  systemctl is-active --quiet nginx
+}
+
+report_nginx_readiness() {
+  local listeners
+  if ! systemctl is-active --quiet nginx; then
+    warn "Đã lưu cấu hình nhưng Nginx chưa chạy. Xem journalctl -u nginx -n 50."
+    warn "Nếu core chiếm 443, chuyển inbound trên panel sang 127.0.0.1:$XHTTP_PORT."
+    warn "Timer thử bật Nginx mỗi phút khi TCP 80/443 hết xung đột."
+  fi
+  listeners="$(ss -H -ltn "sport = :$XHTTP_PORT")" || return 1
+  if ! awk -v target="127.0.0.1:$XHTTP_PORT" '$4 == target {found=1} END {exit !found}' <<< "$listeners"; then
+    warn "Chưa thấy listener 127.0.0.1:$XHTTP_PORT. Cần áp dụng inbound trên panel."
+  fi
+  log "Trạng thái service không xác nhận tunnel hoạt động; cần test profile qua CDN."
+}
+
+stop_nginx_recovery() {
+  systemctl disable --now xhttp-node-nginx-recover.timer >/dev/null 2>&1 || true
+  systemctl stop xhttp-node-nginx-recover.service >/dev/null 2>&1 || true
+}
+
 write_nginx() {
-  install -d -m 755 /etc/nginx/snippets /etc/nginx/sites-available /etc/nginx/sites-enabled
-  cat > /etc/nginx/snippets/xhttp-node-proxy.conf <<'EOF'
+  install -d -m 755 "$(dirname "$NGINX_SNIPPET")" "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")"
+  cat > "$NGINX_SNIPPET" <<'EOF'
 proxy_http_version 1.1;
 proxy_set_header Connection "";
 proxy_set_header Host $host;
@@ -427,7 +476,52 @@ $(proxy_location)
 EOF
   ln -sfn "$NGINX_SITE" "$NGINX_LINK"
   nginx -t
-  systemctl reload nginx
+  if ! apply_nginx_service; then
+    warn "Chưa áp dụng được Nginx; tiếp tục lưu cấu hình và cài timer phục hồi."
+  fi
+}
+
+write_nginx_recovery() {
+  {
+    cat <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+EOF
+    printf 'managed_site=%q\n' "$NGINX_LINK"
+    declare -f warn nginx_ports_available apply_nginx_service
+    cat <<'EOF'
+[[ -s "$managed_site" ]] || exit 0
+# Do not interrupt an active instance or a pending systemd operation.
+state="$(systemctl show -p ActiveState --value nginx)" || exit 1
+case "$state" in inactive|failed) ;; *) exit 0 ;; esac
+apply_nginx_service
+EOF
+  } > "$NGINX_RECOVER_BIN"
+  chmod 700 "$NGINX_RECOVER_BIN"
+  install -d -m 755 "$SYSTEMD_DIR"
+  cat > "$SYSTEMD_DIR/xhttp-node-nginx-recover.service" <<EOF
+[Unit]
+Description=Recover XHTTP Nginx listener after port conflict
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$NGINX_RECOVER_BIN
+TimeoutStartSec=60
+EOF
+  cat > "$SYSTEMD_DIR/xhttp-node-nginx-recover.timer" <<'EOF'
+[Unit]
+Description=Retry XHTTP Nginx every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now xhttp-node-nginx-recover.timer
 }
 
 write_cert_sync() {
@@ -560,7 +654,7 @@ write_exports() {
   case "$CDN_PROVIDER" in
     yandex)
       jq -n --arg domain "$DOMAIN" \
-        '{xmux:{maxConcurrency:"8-16",cMaxReuseTimes:"128-256",hKeepAlivePeriod:30,hMaxRequestTimes:"600-1000",hMaxReusableSecs:"1800-3600"},headers:{Accept:"application/vnd.api+json, application/json, text/plain, */*",Pragma:"no-cache", "Cache-Control":"no-cache", "Accept-Language":"ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"},uplinkHTTPMethod:"GET",uplinkDataPlacement:"header",uplinkDataKey:"X-Playback-Token",serverMaxHeaderBytes:32768,sessionKey:"media_sid",sessionPlacement:"path",seqKey:"offset",seqPlacement:"query",xPaddingKey:"q",xPaddingPlacement:"query",xPaddingMethod:"tokenish",xPaddingBytes:"48-320",xPaddingObfsMode:true,scMaxBufferedPosts:64,scMaxEachPostBytes:"1536-6144",scMinPostsIntervalMs:"10-30"}' > "$extra_file"
+        '{xmux:{maxConcurrency:"8-16",cMaxReuseTimes:"128-256",hKeepAlivePeriod:30,hMaxRequestTimes:"600-1000",hMaxReusableSecs:"1800-3600"},headers:{Accept:"application/vnd.api+json, application/json, text/plain, */*",Pragma:"no-cache", "Cache-Control":"no-cache", "Accept-Language":"ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"},uplinkHTTPMethod:"GET",uplinkDataPlacement:"header",uplinkDataKey:"X-Playback-Token",serverMaxHeaderBytes:32768,sessionIDKey:"media_sid",sessionIDPlacement:"path",seqKey:"offset",seqPlacement:"query",xPaddingKey:"q",xPaddingPlacement:"query",xPaddingMethod:"tokenish",xPaddingBytes:"48-320",xPaddingObfsMode:true,scMaxBufferedPosts:64,scMaxEachPostBytes:"1536-6144",scMinPostsIntervalMs:"10-30"}' > "$extra_file"
       ;;
     vk)
       jq -n --arg cookie "$cookie" \
@@ -568,7 +662,7 @@ write_exports() {
       ;;
     beeline)
       jq -n --arg domain "$DOMAIN" --arg cookie "$cookie" \
-        '{xmux:{maxConcurrency:"1"},seqKey:"chunk_id",seqPlacement:"query",headers:{Accept:"*/*",Cookie:$cookie,Origin:("https://"+$domain+"/"),Referer:("https://"+$domain+"/"),"User-Agent":"Mozilla/5.0(WindowsNT10.0;Win64;x64;rv:151.0)Gecko/20100101Firefox/151.0","Sec-Fetch-Dest":"empty","Sec-Fetch-Mode":"cors","Sec-Fetch-Site":"same-origin","Accept-Language":"ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"},sessionKey:"auth",sessionIDKey:"auth",sessionPlacement:"query",sessionIDPlacement:"query",sessionIDTable:"Base62",sessionIDLength:"16-32",noSSEHeader:true,noGRPCHeader:true,xPaddingBytes:"50-150",xPaddingHeader:"X-Api-Key",xPaddingMethod:"tokenish",xPaddingObfsMode:true,xPaddingPlacement:"header",uplinkHTTPMethod:"POST",downloadHTTPMethod:"GET",uplinkDataPlacement:"body",scMaxBufferedPosts:100,scMaxEachPostBytes:3000000,scMaxConcurrentPosts:10,scMinPostsIntervalMs:"5-10",serverMaxHeaderBytes:32768}' > "$extra_file"
+        '{xmux:{maxConcurrency:"1"},seqKey:"chunk_id",seqPlacement:"query",headers:{Accept:"*/*",Cookie:$cookie,Origin:("https://"+$domain+"/"),Referer:("https://"+$domain+"/"),"User-Agent":"Mozilla/5.0(WindowsNT10.0;Win64;x64;rv:151.0)Gecko/20100101Firefox/151.0","Sec-Fetch-Dest":"empty","Sec-Fetch-Mode":"cors","Sec-Fetch-Site":"same-origin","Accept-Language":"ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"},sessionIDKey:"auth",sessionIDPlacement:"query",sessionIDTable:"Base62",sessionIDLength:"16-32",noSSEHeader:true,noGRPCHeader:true,xPaddingBytes:"50-150",xPaddingHeader:"X-Api-Key",xPaddingMethod:"tokenish",xPaddingObfsMode:true,xPaddingPlacement:"header",uplinkHTTPMethod:"POST",downloadHTTPMethod:"GET",uplinkDataPlacement:"body",scMaxBufferedPosts:100,scMaxEachPostBytes:3000000,scMaxConcurrentPosts:10,scMinPostsIntervalMs:"5-10",serverMaxHeaderBytes:32768}' > "$extra_file"
       ;;
   esac
   local outer='{}'
@@ -617,9 +711,15 @@ check_status() {
   printf 'Provider: %s\nCDN domain: %s\nOrigin target: %s\nOrigin Host/SNI: %s\nClient address: %s\nPath: %s\nXHTTP port: %s\n' "$CDN_PROVIDER" "$DOMAIN" "$ORIGIN_TARGET" "$ORIGIN_HOST" "$CLIENT_ADDRESS" "$XHTTP_PATH" "$XHTTP_PORT"
   check_dns
   check_ports
+  if systemctl is-active --quiet nginx; then
+    log "Nginx: active"
+  else
+    warn "Nginx: inactive; kiểm tra cổng 80/443 và log timer xhttp-node-nginx-recover."
+  fi
   free -h
   systemctl --no-pager --full status node-ram-watchdog.timer 2>/dev/null || true
   systemctl --no-pager --full status xhttp-node-cert-sync.timer 2>/dev/null || true
+  systemctl --no-pager --full status xhttp-node-nginx-recover.timer 2>/dev/null || true
   if [[ -n "$DOMAIN" && -n "$ORIGIN_TARGET" ]]; then
     if valid_ipv4 "$ORIGIN_TARGET"; then
       curl -ksS --noproxy '*' --resolve "$DOMAIN:443:$ORIGIN_TARGET" --max-time 15 -D - -o /dev/null "https://$DOMAIN/healthz" || true
@@ -637,7 +737,8 @@ backup_managed() {
     /etc/nginx/snippets/xhttp-node-proxy.conf /etc/logrotate.d/xhttp-node \
     /etc/systemd/system/node-ram-watchdog.service /etc/systemd/system/node-ram-watchdog.timer \
     /etc/systemd/system/xhttp-node-cert-sync.service /etc/systemd/system/xhttp-node-cert-sync.timer \
-    "$WATCHDOG_BIN" "$CERT_SYNC_BIN"; do
+    /etc/systemd/system/xhttp-node-nginx-recover.service /etc/systemd/system/xhttp-node-nginx-recover.timer \
+    "$WATCHDOG_BIN" "$CERT_SYNC_BIN" "$NGINX_RECOVER_BIN"; do
     [[ -e "$item" || -L "$item" ]] || continue
     mkdir -p "$stamp$(dirname "$item")"
     cp -a "$item" "$stamp$item"
@@ -650,6 +751,7 @@ clean_managed() {
   local backup
   backup="$(backup_managed)"
   log "Backup managed files: $backup"
+  stop_nginx_recovery
   if command_exists docker && docker inspect remnanode >/dev/null 2>&1; then
     docker rm -f remnanode >/dev/null 2>&1 || true
   fi
@@ -659,6 +761,8 @@ clean_managed() {
   rm -f /etc/systemd/system/node-ram-watchdog.service /etc/systemd/system/node-ram-watchdog.timer \
     /etc/systemd/system/xhttp-node-cert-sync.service /etc/systemd/system/xhttp-node-cert-sync.timer \
     "$WATCHDOG_BIN" "$CERT_SYNC_BIN"
+  rm -f /etc/systemd/system/xhttp-node-nginx-recover.service /etc/systemd/system/xhttp-node-nginx-recover.timer \
+    "$NGINX_RECOVER_BIN"
   systemctl daemon-reload
   nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
   log "Đã xóa managed install. Cert ngoài /opt/certbot và website/container khác được giữ nguyên."
@@ -727,14 +831,17 @@ write_setup() {
   [[ ! "$install_node" =~ ^[Nn]$ ]] && install_remnanode
   prepare_certificate
   write_fake_site
+  stop_nginx_recovery
   write_nginx
+  write_nginx_recovery
   write_cert_sync
   write_watchdog
   write_logrotate
   write_exports
   save_state
   check_dns
-  log "Setup hoàn tất"
+  log "Đã lưu cấu hình và cài timer."
+  report_nginx_readiness
   printf '\nHost Extra: %s\nServer inbound: %s\nClient template: %s\n' "$EXPORT_DIR/host-extra.json" "$EXPORT_DIR/server-inbound.json" "$EXPORT_DIR/client-template.json"
   printf 'Provider: %s\nCDN domain: %s\nOrigin: %s://%s:443\nOrigin Host/SNI: %s\nClient edge: %s:443\nPath: %s\n' "$CDN_PROVIDER" "$DOMAIN" "$ORIGIN_PROTOCOL" "$ORIGIN_TARGET" "$ORIGIN_HOST" "$CLIENT_ADDRESS" "$XHTTP_PATH"
   printf 'CDN policy: cache off, preserve query/cookie/body, methods GET/POST, timeout >= 300s.\n'
@@ -760,10 +867,13 @@ change_domain_path() {
   CERT_KEY=""
   prepare_certificate
   write_fake_site
+  stop_nginx_recovery
   write_nginx
+  write_nginx_recovery
   write_exports
   save_state
   log "Đã đổi domain/path. Cập nhật lại Host Extra và subscription."
+  report_nginx_readiness
 }
 
 print_menu() {

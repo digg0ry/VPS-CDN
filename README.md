@@ -32,7 +32,7 @@ Preset path mặc định:
 - VK: `/api/v4/media/session/poll2/`;
 - Beeline: `/xh`.
 
-Yandex preset dùng `GET + header` và `sessionPlacement: path`; không đổi sang cookie/query nếu client báo `400`. VK preset dùng `GET` với padding header riêng. Beeline preset dùng `POST + body`, `downloadHTTPMethod: GET` và cần CDN cho phép POST cùng rewrite đúng path.
+Yandex preset dùng `GET + header` và `sessionIDPlacement: path`; không đổi sang cookie/query nếu client báo `400`. VK preset dùng `GET` với padding header riêng. Beeline preset dùng `POST + body`, `downloadHTTPMethod: GET` và cần CDN cho phép POST cùng rewrite đúng path.
 
 `CDN domain` là domain người dùng kết nối và domain cert. `Origin target` là IP/hostname VPS trong dashboard CDN. `Origin Host/SNI` là hostname CDN gửi tới origin. `Client edge address` là hostname/IP mà profile client dùng làm địa chỉ kết nối; thường là CDN domain, nhưng có thể nhập edge riêng khi nhà cung cấp yêu cầu.
 
@@ -70,6 +70,29 @@ reinstall sạch sẽ backup và tạo lại trang Journal mặc định.
 Nguồn, commit template và license được lưu ở `/opt/xhttp-node/web-template-source.txt`
 và `/opt/xhttp-node/web-template-LICENSE`, ngoài webroot.
 Nếu chưa thấy thay đổi trên domain CDN, kiểm tra cache CDN hoặc thử trực tiếp origin.
+
+## Phục hồi Nginx từ 2.2.1
+
+Setup, Reinstall và đổi domain/path tự cài timer `xhttp-node-nginx-recover.timer`.
+Nginx dùng TCP `443`, XHTTP dùng `127.0.0.1:7443` mặc định. Script không cho chọn
+`80`, `443` hoặc cổng API làm cổng XHTTP nội bộ. Client/CDN vẫn dùng `443`.
+
+Nếu core còn chiếm `443`, script lưu cấu hình và báo chưa sẵn sàng, không kill core.
+Chuyển inbound trên panel sang `127.0.0.1:7443` (hoặc cổng nội bộ đã chọn).
+Timer kiểm tra mỗi phút và chỉ bật Nginx khi inactive/failed, cấu hình hợp lệ,
+không có listener khác chiếm TCP `80/443`. Không restart container hoặc tắt cập nhật OS.
+UDP `443` của Hysteria2 không xung đột với TCP `443` của Nginx.
+
+Timer cũng bật lại Nginx sau khi bạn chủ động stop. Khi bảo trì, dừng timer và service
+`xhttp-node-nginx-recover` trước. Reinstall tự dừng chúng trước khi xóa file managed.
+Nginx active không chứng minh VPN chạy: vẫn cần kiểm tra listener XHTTP và test qua CDN.
+Không cần reinstall chỉ để bật Nginx sau khi đổi cổng trên panel.
+
+```bash
+systemctl status nginx xhttp-node-nginx-recover.timer --no-pager
+journalctl -u xhttp-node-nginx-recover.service -n 50 --no-pager
+ss -ltnp | grep -E ':(443|7443)\b'
+```
 
 ## File trên node
 
