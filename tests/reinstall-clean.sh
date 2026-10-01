@@ -39,13 +39,16 @@ fixture() {
   NGINX_SITE="$BASE/sites-available/xhttp-node.conf" NGINX_LINK="$BASE/sites-enabled/xhttp-node.conf"
   NGINX_SNIPPET="$BASE/proxy.conf" NGINX_CONF_DIR="$BASE/conf.d"
   SYSTEMD_DIR="$BASE/systemd" BACKUP_ROOT="$BASE/backups"
+  LEGACY_WEBROOT_BASE="$BASE/legacy-www"
   WATCHDOG_BIN="$BASE/watchdog" CERT_SYNC_BIN="$BASE/sync" NGINX_RECOVER_BIN="$BASE/recover"
   LOGROTATE_FILE="$BASE/logrotate" CALLS="$BASE/calls"
   mkdir -p "$WEBROOT" "$EXPORT_DIR" "$CERT_DIR" "$NODE_DIR" "$WATCHDOG_STATE_DIR" \
-    "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")" "$NGINX_CONF_DIR" "$SYSTEMD_DIR"
+    "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")" "$NGINX_CONF_DIR" "$SYSTEMD_DIR" "$LEGACY_WEBROOT_BASE/old.example.com"
   printf '# Managed by xhttp-node.sh v2.3.0\n' > "$NGINX_SITE"
   ln -s "$NGINX_SITE" "$NGINX_LINK"
   printf 'proxy_pass http://cdn_xhttp_xray;\n' > "$(dirname "$NGINX_SITE")/old.example.com"
+  printf 'root %s/old.example.com;\n' "$LEGACY_WEBROOT_BASE" >> "$(dirname "$NGINX_SITE")/old.example.com"
+  printf 'legacy web\n' > "$LEGACY_WEBROOT_BASE/old.example.com/index.html"
   ln -s "$(dirname "$NGINX_SITE")/old.example.com" "$(dirname "$NGINX_LINK")/old.example.com"
   printf 'upstream cdn_xhttp_xray { server 127.0.0.1:443; }\n' > "$NGINX_CONF_DIR/cdn-xhttp-upstream.conf"
   printf 'log_format cdn_json escape=json "test";\n' > "$NGINX_CONF_DIR/cdn-log-format.conf"
@@ -70,6 +73,8 @@ clean_managed
 backup=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d)
 [[ -s "$backup$NODE_DIR/docker-compose.yml" && -L "$backup$(dirname "$NGINX_LINK")/old.example.com" ]]
 [[ -s "$backup$NGINX_CONF_DIR/cdn-log-format.conf" ]]
+[[ -s "$backup$LEGACY_WEBROOT_BASE/old.example.com/index.html" ]]
+[[ ! -d "$backup$LEGACY_WEBROOT_BASE/old.example.com/old.example.com" && ! -d "$LEGACY_WEBROOT_BASE/old.example.com" ]]
 [[ ! -e "$NODE_DIR" && ! -e "$STATE_FILE" && ! -e "$NGINX_SITE" && ! -L "$NGINX_LINK" ]]
 [[ ! -f "$NGINX_CONF_DIR/cdn-xhttp-upstream.conf" && ! -f "$NGINX_CONF_DIR/cdn-log-format.conf" ]]
 [[ ! -L "$(dirname "$NGINX_LINK")/old.example.com" && ! -e "$(dirname "$NGINX_SITE")/old.example.com" ]]
@@ -88,6 +93,11 @@ fixture shared_log
 printf 'access_log /tmp/other.log cdn_json;\n' > "$NGINX_CONF_DIR/unrelated-site.conf"
 clean_managed
 [[ -s "$NGINX_CONF_DIR/cdn-log-format.conf" ]]
+
+fixture shared_webroot
+printf 'root %s/old.example.com;\n' "$LEGACY_WEBROOT_BASE" > "$NGINX_CONF_DIR/unrelated-site.conf"
+clean_managed
+[[ -s "$LEGACY_WEBROOT_BASE/old.example.com/index.html" ]]
 
 for failure in stop docker_stop docker_rm; do
   fixture "$failure"

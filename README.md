@@ -11,7 +11,7 @@ Script có menu Bash `select` và các chức năng:
 - xuất `Host Extra`, server inbound template và client template;
 - watchdog kiểm tra mỗi phút, ngưỡng 80%, cooldown 10 phút, chỉ restart container `remnanode`;
 - giữ backup của file managed trước khi rebuild;
-- reinstall sạch: dừng Nginx/timer cũ, backup rồi xóa container/config do script quản lý và cấu hình CDN cũ đã nhận diện, không xóa cert ngoài `/opt/certbot`, website hoặc container khác.
+- reinstall sạch: backup trước, dừng Nginx/timer, rồi xóa cấu hình CDN cũ đã nhận diện và tạo lại; giữ cert, volume, website và container không liên quan;
 - Nginx bind vào IPv4 origin cụ thể khi phát hiện được, tránh server block cũ trên cùng VPS bắt nhầm request CDN.
 
 Script không tự tạo resource CDN. Cấu hình resource trong dashboard CDN:
@@ -52,7 +52,9 @@ Nhập secret tại prompt ẩn khi cài container mới. Biến môi trường 
 
 Không commit `SECRET_KEY`, private key hoặc token vào GitHub.
 
-Tên dependency, image và container cần thiết được giữ để tương thích. Reinstall sẽ backup rồi dừng timer do script quản lý và các cấu hình Nginx có marker XHTTP hoặc upstream `cdn_xhttp_xray`. Cấu hình không có dấu hiệu này không bị xóa tự động.
+Tên dependency, image và container cần thiết được giữ để tương thích. Reinstall nhận diện site/upstream có marker `Managed by xhttp-node.sh` hoặc upstream `cdn_xhttp_xray`, kể cả file từ lần cài cũ. Webroot dạng `/var/www/DOMAIN` của site cũ được backup và xóa nếu không có site giữ lại dùng chung. Log format dùng chung với site khác được giữ. Không xóa chỉ vì tên file bắt đầu bằng `cdn-` hoặc có cùng path XHTTP.
+
+Setup và Reinstall đều nhập thông tin và yêu cầu gõ `REINSTALL` trước khi dọn cấu hình cũ. Chọn `Y` tại câu hỏi recreate để dừng và tạo lại `remnanode`; secret hiện tại được lấy lại mà không in ra màn hình. Chọn `n` để giữ container và compose hiện tại. Timer/service managed được dừng trước khi xóa; Nginx chỉ khởi động lại khi cấu hình mới đã được tạo và test hợp lệ. Backup lỗi hoặc không dừng/xóa được service/container thì dừng thao tác, không báo thành công. Backup tại `/var/backups/xhttp-node/reinstall-*`. Có gián đoạn dịch vụ trong lúc reinstall. Docker Engine, Caddy và dịch vụ không được nhận diện không bị tự động stop/xóa.
 
 ## Tạo hoặc đổi web giả
 
@@ -77,6 +79,8 @@ Nếu chưa thấy thay đổi trên domain CDN, kiểm tra cache CDN hoặc th�
 Setup, Reinstall và đổi domain/path tự cài timer `xhttp-node-nginx-recover.timer`.
 Nginx dùng TCP `443`, bind vào IPv4 origin cụ thể khi có thể, XHTTP dùng `127.0.0.1:7443` mặc định. Script không cho chọn
 `80`, `443` hoặc cổng API làm cổng XHTTP nội bộ. Client/CDN vẫn dùng `443`.
+
+HTTP/2 dùng cú pháp `http2 on` trên Nginx từ 1.25.1; bản cũ dùng `listen ... ssl http2` để tránh lỗi `unknown directive "http2"`. IPv4 bind lấy từ IP local, không dùng trực tiếp IP origin remote/NAT. Khi bind IP cụ thể, kiểm tra `/healthz` bằng IP origin đó, không phải `127.0.0.1`.
 
 Nếu core còn chiếm `443`, script lưu cấu hình và báo chưa sẵn sàng, không kill core.
 Chuyển inbound trên panel sang `127.0.0.1:7443` (hoặc cổng nội bộ đã chọn).

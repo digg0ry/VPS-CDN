@@ -13,6 +13,7 @@ NGINX_LINK="/etc/nginx/sites-enabled/xhttp-node.conf"
 NGINX_SNIPPET="/etc/nginx/snippets/xhttp-node-proxy.conf"
 NGINX_CONF_DIR="/etc/nginx/conf.d"
 NODE_DIR="/opt/remnanode"
+LEGACY_WEBROOT_BASE="/var/www"
 SYSTEMD_DIR="/etc/systemd/system"
 LOGROTATE_FILE="/etc/logrotate.d/xhttp-node"
 WATCHDOG_STATE_DIR="/var/lib/xhttp-node"
@@ -430,8 +431,8 @@ legacy_cdn_paths() {
   for file in "${LEGACY_CDN_PATHS[@]}"; do
     [[ -f "$file" ]] || continue
     while IFS= read -r root; do
-      [[ "$root" == /var/www/* && ! -L "$root" && -d "$root" ]] || continue
-      valid_domain "${root#/var/www/}" || continue
+      [[ "$root" == "$LEGACY_WEBROOT_BASE/"* && ! -L "$root" && -d "$root" ]] || continue
+      valid_domain "${root#"$LEGACY_WEBROOT_BASE/"}" || continue
       referenced=false
       for item in "${configs[@]}"; do
         selected=false
@@ -439,7 +440,11 @@ legacy_cdn_paths() {
         "$selected" && continue
         if grep -qF "root $root;" "$item"; then referenced=true; fi
       done
-      "$referenced" || LEGACY_CDN_PATHS+=("$root")
+      if ! "$referenced"; then
+        selected=false
+        for target in "${LEGACY_CDN_PATHS[@]}"; do [[ "$root" != "$target" ]] || selected=true; done
+        "$selected" || LEGACY_CDN_PATHS+=("$root")
+      fi
     done < <(awk '$1 == "root" && NF == 2 {sub(/;$/, "", $2); print $2}' "$file")
   done
 }
