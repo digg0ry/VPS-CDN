@@ -11,7 +11,8 @@ Script có menu Bash `select` và các chức năng:
 - xuất `Host Extra`, server inbound template và client template;
 - watchdog kiểm tra mỗi phút, ngưỡng 80%, cooldown 10 phút, chỉ restart container `remnanode`;
 - giữ backup của file managed trước khi rebuild;
-- reinstall sạch: backup rồi xóa container/config do script quản lý, không xóa cert, volume, website hoặc container khác.
+- reinstall sạch: dừng Nginx/timer cũ, backup rồi xóa container/config do script quản lý và cấu hình CDN cũ đã nhận diện, không xóa cert ngoài `/opt/certbot`, website hoặc container khác.
+- Nginx bind vào IPv4 origin cụ thể khi phát hiện được, tránh server block cũ trên cùng VPS bắt nhầm request CDN.
 
 Script không tự tạo resource CDN. Cấu hình resource trong dashboard CDN:
 
@@ -51,7 +52,7 @@ Nhập secret tại prompt ẩn khi cài container mới. Biến môi trường 
 
 Không commit `SECRET_KEY`, private key hoặc token vào GitHub.
 
-Tên dependency, image và container cần thiết được giữ để tương thích. Đây là bản cài mới, không tự di chuyển service hoặc dữ liệu của các bản script trước. Trên node đã cài bản khác, kiểm tra listener TCP/443 và timer cũ trước khi chạy để tránh xung đột.
+Tên dependency, image và container cần thiết được giữ để tương thích. Reinstall sẽ backup rồi dừng timer do script quản lý và các cấu hình Nginx có marker XHTTP hoặc upstream `cdn_xhttp_xray`. Cấu hình không có dấu hiệu này không bị xóa tự động.
 
 ## Tạo hoặc đổi web giả
 
@@ -71,10 +72,10 @@ Nguồn, commit template và license được lưu ở `/opt/xhttp-node/web-temp
 và `/opt/xhttp-node/web-template-LICENSE`, ngoài webroot.
 Nếu chưa thấy thay đổi trên domain CDN, kiểm tra cache CDN hoặc thử trực tiếp origin.
 
-## Phục hồi Nginx từ 2.3.0
+## Phục hồi Nginx từ 2.3.1
 
 Setup, Reinstall và đổi domain/path tự cài timer `xhttp-node-nginx-recover.timer`.
-Nginx dùng TCP `443`, XHTTP dùng `127.0.0.1:7443` mặc định. Script không cho chọn
+Nginx dùng TCP `443`, bind vào IPv4 origin cụ thể khi có thể, XHTTP dùng `127.0.0.1:7443` mặc định. Script không cho chọn
 `80`, `443` hoặc cổng API làm cổng XHTTP nội bộ. Client/CDN vẫn dùng `443`.
 
 Nếu core còn chiếm `443`, script lưu cấu hình và báo chưa sẵn sàng, không kill core.

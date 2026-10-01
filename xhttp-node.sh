@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.3.1"
 STATE_DIR="/opt/xhttp-node"
 STATE_FILE="$STATE_DIR/state.env"
 WEBROOT="$STATE_DIR/www"
@@ -11,6 +11,8 @@ CERT_DIR="$STATE_DIR/certs"
 NGINX_SITE="/etc/nginx/sites-available/xhttp-node.conf"
 NGINX_LINK="/etc/nginx/sites-enabled/xhttp-node.conf"
 NGINX_SNIPPET="/etc/nginx/snippets/xhttp-node-proxy.conf"
+NGINX_CONF_DIR="/etc/nginx/conf.d"
+NODE_DIR="/opt/remnanode"
 SYSTEMD_DIR="/etc/systemd/system"
 LOGROTATE_FILE="/etc/logrotate.d/xhttp-node"
 WATCHDOG_STATE_DIR="/var/lib/xhttp-node"
@@ -198,7 +200,7 @@ install_docker() {
 
 install_remnanode() {
   install_docker
-  mkdir -p /opt/remnanode /var/log/remnanode
+  mkdir -p "$NODE_DIR" /var/log/remnanode
   if docker inspect remnanode >/dev/null 2>&1; then
     log "Đã có container remnanode; giữ nguyên compose hiện tại"
     return 0
@@ -211,8 +213,8 @@ install_remnanode() {
   [[ -n "$secret" && "$secret" != *$'\n'* && "$secret" != *$'\r'* ]] || die "SECRET_KEY rỗng hoặc chứa newline"
   local json_secret
   json_secret="$(printf '%s' "$secret" | jq -Rs .)"
-  backup_file /opt/remnanode/docker-compose.yml >/dev/null || true
-  cat > /opt/remnanode/docker-compose.yml <<EOF
+  backup_file "$NODE_DIR/docker-compose.yml" >/dev/null || true
+  cat > "$NODE_DIR/docker-compose.yml" <<EOF
 services:
   remnanode:
     image: remnawave/node:latest
@@ -238,15 +240,16 @@ services:
         max-size: 100m
         max-file: "5"
 EOF
-  chmod 600 /opt/remnanode/docker-compose.yml
-  docker compose -f /opt/remnanode/docker-compose.yml config -q
-  docker compose -f /opt/remnanode/docker-compose.yml pull
-  docker compose -f /opt/remnanode/docker-compose.yml up -d
+  chmod 600 "$NODE_DIR/docker-compose.yml"
+  docker compose -f "$NODE_DIR/docker-compose.yml" config -q
+  docker compose -f "$NODE_DIR/docker-compose.yml" pull
+  docker compose -f "$NODE_DIR/docker-compose.yml" up -d
   unset secret json_secret
 }
 
 find_certificate() {
   local candidates=(
+    "$CERT_DIR/fullchain.pem|$CERT_DIR/privkey.pem"
     "/opt/certbot/certs/live/$DOMAIN/fullchain.pem|/opt/certbot/certs/live/$DOMAIN/privkey.pem"
     "/etc/letsencrypt/live/$DOMAIN/fullchain.pem|/etc/letsencrypt/live/$DOMAIN/privkey.pem"
     "/opt/certbot/certs/live/$ORIGIN_HOST/fullchain.pem|/opt/certbot/certs/live/$ORIGIN_HOST/privkey.pem"
@@ -380,6 +383,112 @@ proxy_location() {
 EOF
 }
 
+local_ipv4() {
+  local address=""
+  if command_exists ip; then
+    address="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+  fi
+  valid_ipv4 "$address" && printf '%s\n' "$address"
+}
+
+legacy_cdn_paths() {
+  local dir item target referenced file selected root
+  local -a configs=()
+  LEGACY_CDN_PATHS=()
+  for dir in "$(dirname "$NGINX_LINK")" "$(dirname "$NGINX_SITE")" "$NGINX_CONF_DIR"; do
+    [[ -d "$dir" ]] || continue
+    for item in "$dir"/*; do
+      [[ -f "$item" ]] || continue
+      configs+=("$item")
+      [[ "$item" == "$NGINX_SITE" || "$item" == "$NGINX_LINK" ]] && continue
+      # Only recognize our marker or the reserved upstream from older installs.
+      grep -qsE '^# Managed by xhttp-node.sh |^[[:space:]]*(upstream[[:space:]]+cdn_xhttp_xray[[:space:]]*\{|proxy_pass[[:space:]]+http://cdn_xhttp_xray[[:space:]]*;)' "$item" || continue
+      if [[ -L "$item" ]]; then
+        target="$(readlink -f "$item")" || return 1
+        case "$target" in
+          "$(readlink -f "$(dirname "$NGINX_SITE")")"/*|"$(readlink -f "$(dirname "$NGINX_LINK")")"/*|"$(readlink -f "$NGINX_CONF_DIR")"/*) ;;
+          *) warn "Site CDN trỏ ra ngoài thư mục Nginx; cần kiểm tra thủ công: $item"; return 1 ;;
+        esac
+      fi
+      LEGACY_CDN_PATHS+=("$item")
+    done
+  done
+  # Retain the shared log format when an unrelated site still uses it.
+  item="$NGINX_CONF_DIR/cdn-log-format.conf"
+  if [[ -f "$item" ]] && grep -qE '^[[:space:]]*log_format[[:space:]]+cdn_json' "$item"; then
+    referenced=false
+    for file in "${configs[@]}"; do
+      [[ "$file" == "$item" ]] && continue
+      selected=false
+      for target in "${LEGACY_CDN_PATHS[@]}"; do [[ "$file" != "$target" ]] || selected=true; done
+      "$selected" && continue
+      if grep -qsE '^[[:space:]]*access_log[[:space:]].*[[:space:]]cdn_json[[:space:]]*;' "$file"; then referenced=true; fi
+    done
+    "$referenced" || LEGACY_CDN_PATHS+=("$item")
+  fi
+  # Remove only domain-specific legacy webroots not used by retained sites.
+  for file in "${LEGACY_CDN_PATHS[@]}"; do
+    [[ -f "$file" ]] || continue
+    while IFS= read -r root; do
+      [[ "$root" == /var/www/* && ! -L "$root" && -d "$root" ]] || continue
+      valid_domain "${root#/var/www/}" || continue
+      referenced=false
+      for item in "${configs[@]}"; do
+        selected=false
+        for target in "${LEGACY_CDN_PATHS[@]}"; do [[ "$item" != "$target" ]] || selected=true; done
+        "$selected" && continue
+        if grep -qF "root $root;" "$item"; then referenced=true; fi
+      done
+      "$referenced" || LEGACY_CDN_PATHS+=("$root")
+    done < <(awk '$1 == "root" && NF == 2 {sub(/;$/, "", $2); print $2}' "$file")
+  done
+}
+
+has_legacy_cdn() {
+  legacy_cdn_paths || return 1
+  ((${#LEGACY_CDN_PATHS[@]} > 0))
+}
+
+backup_legacy_cdn() {
+  local backup="$1" item
+  for item in "${LEGACY_CDN_PATHS[@]}"; do
+    mkdir -p "$backup$(dirname "$item")" || return 1
+    cp -a "$item" "$backup$item" || return 1
+  done
+}
+
+stop_legacy_cdn_units() {
+  local unit
+  for unit in xhttp-node-nginx-recover xhttp-node-cert-sync node-ram-watchdog; do
+    if [[ -e "$SYSTEMD_DIR/$unit.timer" ]]; then
+      systemctl disable --now "$unit.timer" || return 1
+    fi
+    if [[ -e "$SYSTEMD_DIR/$unit.service" ]]; then
+      systemctl stop "$unit.service" || return 1
+    fi
+  done
+}
+
+nginx_tls_listeners() {
+  local bind_ip version listen_options="ssl http2" modern=false
+  bind_ip="$(local_ipv4 || true)"
+  version="$(nginx -v 2>&1)" || return 1
+  if [[ "$version" =~ nginx/([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    if (( BASH_REMATCH[1] > 1 || (BASH_REMATCH[1] == 1 && (BASH_REMATCH[2] > 25 || (BASH_REMATCH[2] == 25 && BASH_REMATCH[3] >= 1))) )); then
+      modern=true
+      listen_options=ssl
+    fi
+  fi
+  if [[ -n "$bind_ip" ]]; then
+    printf '    listen %s:443 %s;\n' "$bind_ip" "$listen_options"
+  else
+    printf '    listen 443 %s;\n' "$listen_options"
+  fi
+  printf '    listen [::]:443 %s;\n' "$listen_options"
+  "$modern" && printf '    http2 on;\n'
+  return 0
+}
+
 nginx_ports_available() {
   local listeners line
   listeners="$(ss -H -ltnp '( sport = :443 )')" || return 1
@@ -425,7 +534,8 @@ stop_nginx_recovery() {
 
 write_nginx() {
   install -d -m 755 "$(dirname "$NGINX_SNIPPET")" "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")"
-  local server_names="$DOMAIN"
+  local server_names="$DOMAIN" listeners
+  listeners="$(nginx_tls_listeners)" || return 1
   [[ "$ORIGIN_HOST" != "$DOMAIN" ]] && server_names+=" $ORIGIN_HOST"
   cat > "$NGINX_SNIPPET" <<'EOF'
 proxy_http_version 1.1;
@@ -448,8 +558,7 @@ EOF
   cat > "$NGINX_SITE" <<EOF
 # Managed by xhttp-node.sh v$SCRIPT_VERSION
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+$listeners
     server_name $server_names;
     ssl_certificate $CERT_FULLCHAIN;
     ssl_certificate_key $CERT_KEY;
@@ -457,6 +566,8 @@ server {
     ssl_session_tickets off;
     root $WEBROOT;
     index index.html;
+    access_log /var/log/nginx/xhttp-node.access.log;
+    error_log /var/log/nginx/xhttp-node.error.log warn;
 
     location = /healthz {
         default_type text/plain;
@@ -728,17 +839,18 @@ check_status() {
 }
 
 backup_managed() {
-  local stamp="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
-  install -d -m 700 "$stamp"
-  for item in "$STATE_DIR" /opt/remnanode "$NGINX_SITE" "$NGINX_LINK" \
-    /etc/nginx/snippets/xhttp-node-proxy.conf /etc/logrotate.d/xhttp-node \
-    /etc/systemd/system/node-ram-watchdog.service /etc/systemd/system/node-ram-watchdog.timer \
-    /etc/systemd/system/xhttp-node-cert-sync.service /etc/systemd/system/xhttp-node-cert-sync.timer \
-    /etc/systemd/system/xhttp-node-nginx-recover.service /etc/systemd/system/xhttp-node-nginx-recover.timer \
+  local stamp item
+  install -d -m 700 "$BACKUP_ROOT" || return 1
+  stamp="$(mktemp -d "$BACKUP_ROOT/reinstall-$(date +%Y%m%d-%H%M%S).XXXXXX")" || return 1
+  for item in "$STATE_DIR" "$NODE_DIR" "$WATCHDOG_STATE_DIR" "$NGINX_SITE" "$NGINX_LINK" \
+    "$NGINX_SNIPPET" "$LOGROTATE_FILE" \
+    "$SYSTEMD_DIR/node-ram-watchdog.service" "$SYSTEMD_DIR/node-ram-watchdog.timer" \
+    "$SYSTEMD_DIR/xhttp-node-cert-sync.service" "$SYSTEMD_DIR/xhttp-node-cert-sync.timer" \
+    "$SYSTEMD_DIR/xhttp-node-nginx-recover.service" "$SYSTEMD_DIR/xhttp-node-nginx-recover.timer" \
     "$WATCHDOG_BIN" "$CERT_SYNC_BIN" "$NGINX_RECOVER_BIN"; do
     [[ -e "$item" || -L "$item" ]] || continue
-    mkdir -p "$stamp$(dirname "$item")"
-    cp -a "$item" "$stamp$item"
+    mkdir -p "$stamp$(dirname "$item")" || return 1
+    cp -a "$item" "$stamp$item" || return 1
   done
   printf '%s\n' "$stamp"
 }
@@ -827,24 +939,38 @@ remove_cdn_managed() {
 
 clean_managed() {
   require_root
-  local backup
-  backup="$(backup_managed)"
+  local backup item recreate_node="${1:-Y}"
+  [[ ! -L "$STATE_DIR" && ! -L "$NODE_DIR" && ! -L "$WATCHDOG_STATE_DIR" ]] || { warn "Thư mục managed là symlink; cần kiểm tra thủ công."; return 1; }
+  legacy_cdn_paths || return 1
+  backup="$(backup_managed)" || { warn "Backup thất bại; chưa dừng/xóa gì."; return 1; }
+  backup_legacy_cdn "$backup" || { warn "Backup CDN cũ thất bại; chưa dừng/xóa gì."; return 1; }
   log "Backup managed files: $backup"
-  stop_nginx_recovery
-  if command_exists docker && docker inspect remnanode >/dev/null 2>&1; then
-    docker rm -f remnanode >/dev/null 2>&1 || true
+  for item in "${LEGACY_CDN_PATHS[@]}"; do printf 'CDN cũ: %s\n' "$item"; done
+  stop_legacy_cdn_units || { warn "Không dừng được timer/service; chưa xóa file. Backup: $backup"; return 1; }
+  if systemctl is-active --quiet nginx; then
+    systemctl stop nginx || { warn "Không dừng được Nginx cũ; chưa xóa cấu hình."; return 1; }
   fi
-  rm -rf /opt/remnanode "$STATE_DIR"
-  rm -f "$NGINX_LINK" "$NGINX_SITE" "$NGINX_SNIPPET" "$LOGROTATE_FILE"
-  systemctl disable --now node-ram-watchdog.timer xhttp-node-cert-sync.timer >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/node-ram-watchdog.service /etc/systemd/system/node-ram-watchdog.timer \
-    /etc/systemd/system/xhttp-node-cert-sync.service /etc/systemd/system/xhttp-node-cert-sync.timer \
-    "$WATCHDOG_BIN" "$CERT_SYNC_BIN"
-  rm -f /etc/systemd/system/xhttp-node-nginx-recover.service /etc/systemd/system/xhttp-node-nginx-recover.timer \
-    "$NGINX_RECOVER_BIN"
-  systemctl daemon-reload
-  nginx -t >/dev/null 2>&1 && systemctl reload nginx || true
-  log "Đã xóa managed install. Cert ngoài /opt/certbot và website/container khác được giữ nguyên."
+  if [[ ! "$recreate_node" =~ ^[Nn]$ ]]; then
+    if command_exists docker && docker inspect remnanode >/dev/null 2>&1; then
+      docker stop -t 20 remnanode >/dev/null || return 1
+      docker rm remnanode >/dev/null || return 1
+    fi
+    rm -rf -- "$NODE_DIR" || return 1
+  fi
+  for item in "${LEGACY_CDN_PATHS[@]}"; do rm -rf -- "$item" || return 1; done
+  rm -rf -- "$STATE_DIR" "$WATCHDOG_STATE_DIR" || return 1
+  # Copied certs may still serve a non-CDN inbound; retain them even on reinstall.
+  if [[ -d "$backup$CERT_DIR" ]]; then
+    mkdir -p "$(dirname "$CERT_DIR")" || return 1
+    cp -a "$backup$CERT_DIR" "$CERT_DIR" || return 1
+  fi
+  rm -f "$NGINX_LINK" "$NGINX_SITE" "$NGINX_SNIPPET" "$LOGROTATE_FILE" \
+    "$SYSTEMD_DIR/node-ram-watchdog.service" "$SYSTEMD_DIR/node-ram-watchdog.timer" \
+    "$SYSTEMD_DIR/xhttp-node-cert-sync.service" "$SYSTEMD_DIR/xhttp-node-cert-sync.timer" \
+    "$SYSTEMD_DIR/xhttp-node-nginx-recover.service" "$SYSTEMD_DIR/xhttp-node-nginx-recover.timer" \
+    "$WATCHDOG_BIN" "$CERT_SYNC_BIN" "$NGINX_RECOVER_BIN" || return 1
+  systemctl daemon-reload || return 1
+  log "Đã dừng và dọn CDN cũ; Nginx chỉ bật lại sau khi tạo cấu hình mới. Giữ cert và dịch vụ khác."
 }
 
 select_provider() {
@@ -862,8 +988,7 @@ select_provider() {
 }
 
 reinstall_clean() {
-  clean_managed
-  write_setup
+  write_setup reinstall
 }
 
 check_files() {
@@ -880,7 +1005,7 @@ check_files() {
 write_setup() {
   require_root
   load_state
-  local answer install_node cert cert_key path_default
+  local answer install_node cert cert_key path_default force_reinstall="${1:-}" old_env
   select_provider
   path_default="$(default_path_for_provider)"
   read -r -p "CDN domain/certificate [$DOMAIN]: " answer; [[ -n "$answer" ]] && DOMAIN="${answer,,}"
@@ -898,13 +1023,30 @@ write_setup() {
   read -r -p "Cert private key path (blank=auto/self-signed): " cert_key
   CERT_FULLCHAIN="$cert"; CERT_KEY="$cert_key"
   check_inputs
-  if [[ -e "$STATE_FILE" || -e "$NGINX_SITE" || -e /opt/remnanode/docker-compose.yml ]] || \
-    (command_exists docker && docker inspect remnanode >/dev/null 2>&1); then
-    read -r -p "Đã có managed install. Gõ REINSTALL để backup và xóa sạch trước khi tạo lại: " answer
+  read -r -p "Cài/recreate remnanode? [Y/n] (n=giữ node hiện tại): " install_node
+  if [[ "$force_reinstall" == reinstall || -e "$STATE_FILE" || -e "$NGINX_SITE" || -e "$NODE_DIR/docker-compose.yml" ]] || \
+    (command_exists docker && docker inspect remnanode >/dev/null 2>&1) || has_legacy_cdn; then
+    printf 'Reinstall dừng Nginx/timer, backup và xóa cấu hình CDN cũ đã nhận diện.\n'
+    [[ "$install_node" =~ ^[Nn]$ ]] || printf 'Container remnanode cũ sẽ bị dừng và tạo lại.\n'
+    read -r -p "Gõ REINSTALL để xác nhận: " answer
     [[ "$answer" == REINSTALL ]] || die "Đã hủy để không ghi đè cấu hình cũ"
-    clean_managed
+    # Recover the existing secret before removing the container, without logging it.
+    if [[ ! "$install_node" =~ ^[Nn]$ && -z "${NODE_SECRET_KEY:-}" ]]; then
+      if command_exists docker && docker inspect remnanode >/dev/null 2>&1; then
+        old_env="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' remnanode)" || return 1
+        while IFS= read -r answer; do
+          case "$answer" in SECRET_KEY=*) NODE_SECRET_KEY="${answer#SECRET_KEY=}" ;; esac
+        done <<< "$old_env"
+        unset old_env
+      fi
+      if [[ -z "${NODE_SECRET_KEY:-}" ]]; then
+        read -r -s -p 'SECRET_KEY từ panel (trước khi dừng node): ' NODE_SECRET_KEY
+        printf '\n'
+        [[ -n "$NODE_SECRET_KEY" ]] || die "SECRET_KEY rỗng; chưa dừng/xóa gì"
+      fi
+    fi
+    clean_managed "$install_node" || return 1
   fi
-  read -r -p "Cài/recreate remnanode? [Y/n]: " install_node
 
   install_packages
   [[ ! "$install_node" =~ ^[Nn]$ ]] && install_remnanode

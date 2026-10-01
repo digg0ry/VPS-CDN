@@ -74,6 +74,27 @@ reset_mocks
 ACTIVE=active RELOAD_RC=1
 expect_failure apply_nginx_service
 
+# Both Nginx syntaxes must work, including origin IP-specific virtual hosts.
+(
+  local_ipv4() { printf '192.0.2.1\n'; }
+  nginx() { printf 'nginx version: nginx/%s\n' "$VERSION"; }
+  for VERSION in 1.18.0 1.24.0 1.25.0; do
+    output="$(nginx_tls_listeners)"
+    grep -q 'listen 192.0.2.1:443 ssl http2;' <<< "$output"
+    ! grep -q 'http2 on;' <<< "$output"
+  done
+  for VERSION in 1.25.1 1.28.3; do
+    output="$(nginx_tls_listeners)"
+    grep -q 'listen 192.0.2.1:443 ssl;' <<< "$output"
+    grep -q 'http2 on;' <<< "$output"
+    ! grep -q 'ssl http2;' <<< "$output"
+  done
+  local_ipv4() { return 1; }
+  output="$(nginx_tls_listeners)"
+  grep -q 'listen 443 ssl;' <<< "$output"
+  grep -q 'listen \[::\]:443 ssl;' <<< "$output"
+)
+
 DOMAIN=cdn.example.com ORIGIN_HOST=cdn.example.com CLIENT_ADDRESS=cdn.example.com
 ORIGIN_TARGET=192.0.2.1 CDN_PROVIDER=yandex XHTTP_PORT=7443 NODE_PORT=34534
 check_inputs
@@ -155,12 +176,12 @@ assert_not_called "systemctl start nginx"
   check_dns() { :; }
   report_nginx_readiness() { :; }
   # Existing temp state triggers the REINSTALL confirmation in Setup.
-  printf '\n\n\n\n\n\n\n\n\n\n\nREINSTALL\nn\n' | write_setup
+  printf '\n\n\n\n\n\n\n\n\n\n\nn\nREINSTALL\nn\n' | write_setup
   assert_called recovery
   assert_called config
   assert_called 'stop recovery'
   reset_mocks
-  printf '\n\n\n\n\n\n\n\n\n\n\nREINSTALL\nn\n' | reinstall_clean
+  printf '\n\n\n\n\n\n\n\n\n\n\nn\nREINSTALL\nn\n' | reinstall_clean
   assert_called clean
   assert_called recovery
 )
