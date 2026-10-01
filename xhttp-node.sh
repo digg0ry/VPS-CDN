@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2.2.1"
+SCRIPT_VERSION="2.3.0"
 STATE_DIR="/opt/xhttp-node"
 STATE_FILE="$STATE_DIR/state.env"
 WEBROOT="$STATE_DIR/www"
@@ -12,6 +12,8 @@ NGINX_SITE="/etc/nginx/sites-available/xhttp-node.conf"
 NGINX_LINK="/etc/nginx/sites-enabled/xhttp-node.conf"
 NGINX_SNIPPET="/etc/nginx/snippets/xhttp-node-proxy.conf"
 SYSTEMD_DIR="/etc/systemd/system"
+LOGROTATE_FILE="/etc/logrotate.d/xhttp-node"
+WATCHDOG_STATE_DIR="/var/lib/xhttp-node"
 WATCHDOG_BIN="/usr/local/sbin/node-ram-watchdog"
 CERT_SYNC_BIN="/usr/local/sbin/xhttp-node-cert-sync"
 NGINX_RECOVER_BIN="/usr/local/sbin/xhttp-node-nginx-recover"
@@ -380,12 +382,12 @@ EOF
 
 nginx_ports_available() {
   local listeners line
-  listeners="$(ss -H -ltnp '( sport = :80 or sport = :443 )')" || return 1
+  listeners="$(ss -H -ltnp '( sport = :443 )')" || return 1
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
-    # Unknown owners also block startup; never kill another service.
+    # Unknown owners block startup; never kill another service.
     if [[ "$line" != *'("nginx",'* ]]; then
-      warn "TCP 80/443 có listener không thuộc Nginx: $line"
+      warn "TCP 443 có listener không thuộc Nginx: $line"
       return 1
     fi
   done <<< "$listeners"
@@ -407,7 +409,7 @@ report_nginx_readiness() {
   if ! systemctl is-active --quiet nginx; then
     warn "Đã lưu cấu hình nhưng Nginx chưa chạy. Xem journalctl -u nginx -n 50."
     warn "Nếu core chiếm 443, chuyển inbound trên panel sang 127.0.0.1:$XHTTP_PORT."
-    warn "Timer thử bật Nginx mỗi phút khi TCP 80/443 hết xung đột."
+    warn "Timer thử bật Nginx mỗi phút khi TCP 443 hết xung đột."
   fi
   listeners="$(ss -H -ltn "sport = :$XHTTP_PORT")" || return 1
   if ! awk -v target="127.0.0.1:$XHTTP_PORT" '$4 == target {found=1} END {exit !found}' <<< "$listeners"; then
@@ -423,6 +425,8 @@ stop_nginx_recovery() {
 
 write_nginx() {
   install -d -m 755 "$(dirname "$NGINX_SNIPPET")" "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")"
+  local server_names="$DOMAIN"
+  [[ "$ORIGIN_HOST" != "$DOMAIN" ]] && server_names+=" $ORIGIN_HOST"
   cat > "$NGINX_SNIPPET" <<'EOF'
 proxy_http_version 1.1;
 proxy_set_header Connection "";
@@ -444,16 +448,9 @@ EOF
   cat > "$NGINX_SITE" <<EOF
 # Managed by xhttp-node.sh v$SCRIPT_VERSION
 server {
-    listen 80;
-    listen [::]:80;
-    server_name $DOMAIN $ORIGIN_HOST;
-    return 301 https://\$host\$request_uri;
-}
-
-server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
-    server_name $DOMAIN $ORIGIN_HOST;
+    server_name $server_names;
     ssl_certificate $CERT_FULLCHAIN;
     ssl_certificate_key $CERT_KEY;
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -714,7 +711,7 @@ check_status() {
   if systemctl is-active --quiet nginx; then
     log "Nginx: active"
   else
-    warn "Nginx: inactive; kiểm tra cổng 80/443 và log timer xhttp-node-nginx-recover."
+    warn "Nginx: inactive; kiểm tra cổng 443 và log timer xhttp-node-nginx-recover."
   fi
   free -h
   systemctl --no-pager --full status node-ram-watchdog.timer 2>/dev/null || true
@@ -746,6 +743,88 @@ backup_managed() {
   printf '%s\n' "$stamp"
 }
 
+backup_cdn_managed() {
+  local stamp item
+  install -d -m 700 "$BACKUP_ROOT" || return 1
+  stamp="$(mktemp -d "$BACKUP_ROOT/cdn-remove-$(date +%Y%m%d-%H%M%S).XXXXXX")" || return 1
+  for item in "$STATE_DIR" "$NGINX_SITE" "$NGINX_LINK" "$NGINX_SNIPPET" \
+    "$LOGROTATE_FILE" "$WATCHDOG_STATE_DIR" \
+    "$SYSTEMD_DIR/node-ram-watchdog.service" "$SYSTEMD_DIR/node-ram-watchdog.timer" \
+    "$SYSTEMD_DIR/xhttp-node-cert-sync.service" "$SYSTEMD_DIR/xhttp-node-cert-sync.timer" \
+    "$SYSTEMD_DIR/xhttp-node-nginx-recover.service" "$SYSTEMD_DIR/xhttp-node-nginx-recover.timer" \
+    "$WATCHDOG_BIN" "$CERT_SYNC_BIN" "$NGINX_RECOVER_BIN"; do
+    [[ -e "$item" || -L "$item" ]] || continue
+    mkdir -p "$stamp$(dirname "$item")" || return 1
+    cp -a "$item" "$stamp$item" || return 1
+  done
+  printf '%s\n' "$stamp"
+}
+
+remove_cdn_managed() {
+  require_root
+  local answer backup item unit
+  printf '\nGỡ cấu hình CDN do xhttp-node.sh quản lý.\n'
+  printf 'Máy hiện tại: %s\n' "$(hostname)"
+  ip -brief address 2>/dev/null || true
+  printf 'Giữ remnanode, /opt/certbot, Docker và dịch vụ không do script tạo.\n'
+  printf 'Xóa web giả, Nginx origin, exports, watchdog và timer. Giữ cert và backup.\n'
+  read -r -p 'Gõ REMOVE-CDN để xác nhận trên máy này: ' answer || return 0
+  [[ "$answer" == REMOVE-CDN ]] || { warn "Đã hủy."; return 0; }
+
+  [[ ! -L "$STATE_DIR" && ! -L "$WATCHDOG_STATE_DIR" ]] || return 1
+  backup="$(backup_cdn_managed)" || { warn "Backup thất bại; chưa xóa gì."; return 1; }
+  log "Backup CDN: $backup"
+
+  if [[ -e "$NGINX_SITE" || -L "$NGINX_SITE" ]]; then
+    if [[ -L "$NGINX_SITE" ]] || ! grep -q '^# Managed by xhttp-node.sh ' "$NGINX_SITE"; then
+      warn "Không xóa site không do script quản lý: $NGINX_SITE"
+      return 1
+    fi
+  fi
+  if [[ -e "$NGINX_LINK" || -L "$NGINX_LINK" ]]; then
+    if [[ ! -L "$NGINX_LINK" ]] || [[ "$(readlink -f "$NGINX_LINK" 2>/dev/null || true)" != "$(readlink -f "$NGINX_SITE" 2>/dev/null || true)" ]]; then
+      warn "Không xóa site enabled không do script quản lý: $NGINX_LINK"
+      return 1
+    fi
+  fi
+  for unit in xhttp-node-nginx-recover xhttp-node-cert-sync node-ram-watchdog; do
+    if [[ -e "$SYSTEMD_DIR/$unit.timer" ]]; then
+      systemctl disable --now "$unit.timer" || return 1
+    fi
+    if [[ -e "$SYSTEMD_DIR/$unit.service" ]]; then
+      systemctl stop "$unit.service" || return 1
+    fi
+  done
+  rm -f "$NGINX_LINK" "$NGINX_SITE" "$NGINX_SNIPPET" || return 1
+  if command_exists nginx; then
+    if ! nginx -t || { systemctl is-active --quiet nginx && ! systemctl reload nginx; }; then
+      for item in "$NGINX_SITE" "$NGINX_LINK" "$NGINX_SNIPPET"; do
+        if [[ -e "$backup$item" || -L "$backup$item" ]]; then
+          cp -a "$backup$item" "$item" || return 1
+        fi
+      done
+      warn "Nginx không áp dụng được. Đã trả file về; dữ liệu còn nguyên, timer đang dừng. Backup: $backup"
+      return 1
+    fi
+  fi
+
+  rm -f "$LOGROTATE_FILE" \
+    "$WATCHDOG_BIN" "$CERT_SYNC_BIN" "$NGINX_RECOVER_BIN" \
+    "$SYSTEMD_DIR/node-ram-watchdog.service" "$SYSTEMD_DIR/node-ram-watchdog.timer" \
+    "$SYSTEMD_DIR/xhttp-node-cert-sync.service" "$SYSTEMD_DIR/xhttp-node-cert-sync.timer" \
+    "$SYSTEMD_DIR/xhttp-node-nginx-recover.service" "$SYSTEMD_DIR/xhttp-node-nginx-recover.timer"
+  # Even copied certs may be used by a non-CDN inbound.
+  rm -rf -- "$WEBROOT" "$EXPORT_DIR"
+  rm -f "$STATE_FILE" "$STATE_DIR/web-template-source.txt" "$STATE_DIR/web-template-LICENSE" \
+    "$WATCHDOG_STATE_DIR/last-restart"
+  rmdir "$WATCHDOG_STATE_DIR" "$STATE_DIR" 2>/dev/null || true
+  systemctl daemon-reload
+  log "Đã gỡ CDN managed. Giữ remnanode và cert, kể cả $CERT_DIR."
+  warn "Đổi profile trên Remnawave về node thường; script không sửa panel."
+  warn "DNS/resource CDN, Caddy và cấu hình do công cụ khác tạo không bị xóa."
+  ss -ltnp '( sport = :80 or sport = :443 or sport = :7443 )' || true
+}
+
 clean_managed() {
   require_root
   local backup
@@ -756,7 +835,7 @@ clean_managed() {
     docker rm -f remnanode >/dev/null 2>&1 || true
   fi
   rm -rf /opt/remnanode "$STATE_DIR"
-  rm -f "$NGINX_LINK" "$NGINX_SITE" /etc/nginx/snippets/xhttp-node-proxy.conf /etc/logrotate.d/xhttp-node
+  rm -f "$NGINX_LINK" "$NGINX_SITE" "$NGINX_SNIPPET" "$LOGROTATE_FILE"
   systemctl disable --now node-ram-watchdog.timer xhttp-node-cert-sync.timer >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/node-ram-watchdog.service /etc/systemd/system/node-ram-watchdog.timer \
     /etc/systemd/system/xhttp-node-cert-sync.service /etc/systemd/system/xhttp-node-cert-sync.timer \
@@ -879,7 +958,7 @@ change_domain_path() {
 print_menu() {
   printf '\nXHTTP Node Manager v%s\n' "$SCRIPT_VERSION"
   PS3='Chọn số: '
-  select action in "Setup / rebuild VPS" "Reinstall sạch (backup rồi xóa managed)" "Đổi CDN/domain/origin/path" "Kiểm tra node" "Kiểm tra file và JSON" "Xuất Host Extra" "Cài/cập nhật watchdog" "Tạo / đổi web giả (chọn template)" "Thoát"; do
+  select action in "Setup / rebuild VPS" "Reinstall sạch (backup rồi xóa managed)" "Đổi CDN/domain/origin/path" "Kiểm tra node" "Kiểm tra file và JSON" "Xuất Host Extra" "Cài/cập nhật watchdog" "Tạo / đổi web giả (chọn template)" "Gỡ CDN, giữ node thường" "Thoát"; do
     case "$REPLY" in
       1) write_setup; break ;;
       2) reinstall_clean; break ;;
@@ -889,7 +968,8 @@ print_menu() {
       6) load_state; cat "$EXPORT_DIR/host-extra.json" 2>/dev/null || warn "Chưa có Host Extra"; break ;;
       7) require_root; load_state; write_watchdog; log "Watchdog: RAM ${RAM_THRESHOLD}%, mỗi phút, cooldown ${COOLDOWN}s, chỉ restart remnanode"; break ;;
       8) web_template_menu; break ;;
-      9) exit 0 ;;
+      9) remove_cdn_managed; break ;;
+      10) exit 0 ;;
       *) warn "Lựa chọn không hợp lệ" ;;
     esac
   done

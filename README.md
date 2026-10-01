@@ -71,7 +71,7 @@ Nguồn, commit template và license được lưu ở `/opt/xhttp-node/web-temp
 và `/opt/xhttp-node/web-template-LICENSE`, ngoài webroot.
 Nếu chưa thấy thay đổi trên domain CDN, kiểm tra cache CDN hoặc thử trực tiếp origin.
 
-## Phục hồi Nginx từ 2.2.1
+## Phục hồi Nginx từ 2.3.0
 
 Setup, Reinstall và đổi domain/path tự cài timer `xhttp-node-nginx-recover.timer`.
 Nginx dùng TCP `443`, XHTTP dùng `127.0.0.1:7443` mặc định. Script không cho chọn
@@ -80,13 +80,23 @@ Nginx dùng TCP `443`, XHTTP dùng `127.0.0.1:7443` mặc định. Script không
 Nếu core còn chiếm `443`, script lưu cấu hình và báo chưa sẵn sàng, không kill core.
 Chuyển inbound trên panel sang `127.0.0.1:7443` (hoặc cổng nội bộ đã chọn).
 Timer kiểm tra mỗi phút và chỉ bật Nginx khi inactive/failed, cấu hình hợp lệ,
-không có listener khác chiếm TCP `80/443`. Không restart container hoặc tắt cập nhật OS.
+không có listener khác chiếm TCP `443`. HTTP port `80` không cần dùng vì profile mặc định là HTTPS.
+Không restart container hoặc tắt cập nhật OS.
 UDP `443` của Hysteria2 không xung đột với TCP `443` của Nginx.
 
 Timer cũng bật lại Nginx sau khi bạn chủ động stop. Khi bảo trì, dừng timer và service
 `xhttp-node-nginx-recover` trước. Reinstall tự dừng chúng trước khi xóa file managed.
 Nginx active không chứng minh VPN chạy: vẫn cần kiểm tra listener XHTTP và test qua CDN.
 Không cần reinstall chỉ để bật Nginx sau khi đổi cổng trên panel.
+
+Menu **9) Gỡ CDN, giữ node thường** gỡ Nginx origin, web giả, exports,
+logrotate, watchdog và timer do script quản lý. Script backup trước khi xóa, giữ
+`remnanode`, toàn bộ cert (kể cả `/opt/xhttp-node/certs`), `/opt/certbot`, Docker và dịch vụ khác. Sau đó đổi Config Profile
+trên Remnawave về inbound node thường; panel không được script sửa.
+Nhập `REMOVE-CDN` sau khi kiểm tra hostname/IP hiển thị. Không chọn Reinstall để gỡ CDN.
+DNS/resource trên nhà cung cấp CDN, Caddy và cấu hình do công cụ khác tạo không bị xóa.
+Nếu Nginx test/reload thất bại, script trả file Nginx về và dừng, không báo gỡ thành công.
+Backup nằm trong `/var/backups/xhttp-node/cdn-remove-*`, quyền riêng tư cho root.
 
 ```bash
 systemctl status nginx xhttp-node-nginx-recover.timer --no-pager

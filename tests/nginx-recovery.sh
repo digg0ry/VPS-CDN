@@ -57,7 +57,7 @@ reset_mocks
 LISTENERS='LISTEN 0 511 [::]:443 [::]:* users:(("caddy",pid=30,fd=7))'
 expect_failure apply_nginx_service
 reset_mocks
-LISTENERS='LISTEN 0 511 0.0.0.0:80 0.0.0.0:*'
+LISTENERS='LISTEN 0 511 0.0.0.0:443 0.0.0.0:*'
 expect_failure apply_nginx_service
 reset_mocks
 SS_RC=1
