@@ -33,7 +33,13 @@ Preset path mặc định:
 - VK: `/api/v4/media/session/poll2/`;
 - Beeline: `/xh`.
 
-Yandex preset dùng `GET + header` và `sessionIDPlacement: path`; không đổi sang cookie/query nếu client báo `400`. VK preset dùng `GET` với padding header riêng. Beeline preset dùng `POST + body`, `downloadHTTPMethod: GET` và cần CDN cho phép POST cùng rewrite đúng path.
+Từ `2.3.2`, Yandex preset thử `GET + header`, `uplinkChunkSize: "2000-3000"`, `sessionIDKey: "auth"`, `sessionIDPlacement: "query"`, `seqKey: "offset"` và `seqPlacement: "query"`. XMUX dùng `maxConnections: "1"`, không dùng cùng `maxConcurrency`; các giới hạn reuse trong XMUX đặt `"0"`. Buffer 100, payload mỗi packet tối đa 8192 byte, khoảng cách gửi 30 ms, padding `"100-1000"`. VK và Beeline giữ nguyên preset trước đó.
+
+Đổi session placement/key là đổi framing: phải cập nhật **cả inbound trên Remnawave lẫn Host Extra**, rồi refresh subscription/profile client. Chỉ cập nhật script hoặc file JSON trên VPS không thay inbound đang chạy do panel quản lý. Nên thử trên Host/profile bản sao trước; không cần reinstall, đổi cert, domain hoặc path để thử preset.
+
+`sessionKey` và `sessionPlacement` trong mẫu tham khảo không thuộc schema Xray 26.7.28; bản xuất dùng `sessionIDKey` và `sessionIDPlacement`. Giữ `serverMaxHeaderBytes: 32768` ở inbound vì payload 8192 byte được Base64 thành khoảng 10923 ký tự, chưa tính padding/header khác. `uplinkChunkSize` chia payload đã mã hóa thành từng header `X-Playback-Token-N`, không giới hạn tổng kích thước header của request. `sessionIDTable: ""` dùng UUID mặc định; `sessionIDLength` không tạo ID 16-32 ký tự khi bảng ký tự rỗng. Một kết nối XMUX không đảm bảo nhanh hơn hoặc sửa mọi lỗi CDN.
+
+VK preset dùng `GET` với padding header riêng. Beeline preset dùng `POST + body`, `downloadHTTPMethod: GET` và cần CDN cho phép POST cùng rewrite đúng path.
 
 `CDN domain` là domain người dùng kết nối và domain cert. `Origin target` là IP/hostname VPS trong dashboard CDN. `Origin Host/SNI` là hostname CDN gửi tới origin. `Client edge address` là hostname/IP mà profile client dùng làm địa chỉ kết nối; thường là CDN domain, nhưng có thể nhập edge riêng khi nhà cung cấp yêu cầu.
 

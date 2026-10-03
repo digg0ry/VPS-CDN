@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2.3.1"
+SCRIPT_VERSION="2.3.2"
 STATE_DIR="/opt/xhttp-node"
 STATE_FILE="$STATE_DIR/state.env"
 WEBROOT="$STATE_DIR/www"
@@ -766,8 +766,30 @@ write_exports() {
   extra_file="$EXPORT_DIR/host-extra.json"
   case "$CDN_PROVIDER" in
     yandex)
-      jq -n --arg domain "$DOMAIN" \
-        '{xmux:{maxConcurrency:"8-16",cMaxReuseTimes:"128-256",hKeepAlivePeriod:30,hMaxRequestTimes:"600-1000",hMaxReusableSecs:"1800-3600"},headers:{Accept:"application/vnd.api+json, application/json, text/plain, */*",Pragma:"no-cache", "Cache-Control":"no-cache", "Accept-Language":"ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"},uplinkHTTPMethod:"GET",uplinkDataPlacement:"header",uplinkDataKey:"X-Playback-Token",serverMaxHeaderBytes:32768,sessionIDKey:"media_sid",sessionIDPlacement:"path",seqKey:"offset",seqPlacement:"query",xPaddingKey:"q",xPaddingPlacement:"query",xPaddingMethod:"tokenish",xPaddingBytes:"48-320",xPaddingObfsMode:true,scMaxBufferedPosts:64,scMaxEachPostBytes:"1536-6144",scMinPostsIntervalMs:"10-30"}' > "$extra_file"
+      jq -n '{
+        xmux: {
+          cMaxReuseTimes: "0",
+          maxConnections: "1",
+          hKeepAlivePeriod: 0,
+          hMaxRequestTimes: "0",
+          hMaxReusableSecs: "0"
+        },
+        seqKey: "offset",
+        seqPlacement: "query",
+        sessionIDKey: "auth",
+        sessionIDPlacement: "query",
+        sessionIDTable: "",
+        sessionIDLength: "16-32",
+        uplinkHTTPMethod: "GET",
+        uplinkDataPlacement: "header",
+        uplinkDataKey: "X-Playback-Token",
+        uplinkChunkSize: "2000-3000",
+        xPaddingBytes: "100-1000",
+        scMaxBufferedPosts: 100,
+        scMaxEachPostBytes: 8192,
+        scMinPostsIntervalMs: 30,
+        serverMaxHeaderBytes: 32768
+      }' > "$extra_file"
       ;;
     vk)
       jq -n --arg cookie "$cookie" \
