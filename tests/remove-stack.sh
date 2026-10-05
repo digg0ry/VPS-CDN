@@ -134,7 +134,7 @@ backup="$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d)"
 [[ -s "$backup$NODE_DIR/docker-compose.yml" && -s "$backup$CERT_DIR/privkey.pem" ]]
 [[ ! -e "$backup$NODE_LOG_DIR" && ! -e "$backup$NGINX_SYSTEM_LOG_DIR" ]]
 jq -e 'length == 1 and .[0].Name == "/remnanode"' "$backup/containers.json" >/dev/null
-[[ "$(stat -f %Lp "$backup" 2>/dev/null || stat -c %a "$backup")" == 700 ]]
+[[ "$(stat -c %a "$backup" 2>/dev/null || stat -f %Lp "$backup")" == 700 ]]
 ! grep -q 'SECRET_KEY=fixture' "$BASE/output"
 stop_line="$(grep -n '^docker stop -t 20 remna$' "$CALLS" | cut -d: -f1)"
 purge_line="$(grep -n '^apt-get -y purge' "$CALLS" | cut -d: -f1)"
