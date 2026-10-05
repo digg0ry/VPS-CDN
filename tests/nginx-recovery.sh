@@ -105,6 +105,8 @@ done
 NGINX_SITE="$TMP/sites-available/node.conf"
 NGINX_LINK="$TMP/sites-enabled/node.conf"
 NGINX_SNIPPET="$TMP/snippets/proxy.conf"
+NGINX_LOG_DIR="$TMP/logs"
+NGINX_LOG_FORMAT="$TMP/conf.d/logging.conf"
 NGINX_RECOVER_BIN="$TMP/recover"
 SYSTEMD_DIR="$TMP/systemd"
 BACKUP_ROOT="$TMP/backups"
@@ -172,7 +174,7 @@ assert_not_called "systemctl start nginx"
   write_nginx_recovery() { printf 'recovery\n' >> "$CALLS"; }
   write_cert_sync() { :; }
   write_watchdog() { :; }
-  write_logrotate() { :; }
+  write_logrotate() { printf 'rotation\n' >> "$CALLS"; }
   check_dns() { :; }
   report_nginx_readiness() { :; }
   # Existing temp state triggers the REINSTALL confirmation in Setup.
@@ -180,9 +182,18 @@ assert_not_called "systemctl start nginx"
   assert_called recovery
   assert_called config
   assert_called 'stop recovery'
+  assert_called rotation
   reset_mocks
   printf '\n\n\n\n\n\n\n\n\n\n\nn\nREINSTALL\nn\n' | reinstall_clean
   assert_called clean
   assert_called recovery
+  assert_called rotation
+  reset_mocks
+  STATE_FILE="$TMP/fresh-state.env" NGINX_SITE="$TMP/fresh-site.conf" NODE_DIR="$TMP/fresh-node"
+  has_legacy_cdn() { return 1; }
+  printf '\n\n\n\n\n\n\n\n\n\n\nn\n' | write_setup
+  assert_called rotation
+  assert_called config
+  assert_not_called clean
 )
 printf 'PASS: Nginx activation, conflicts, recovery, ports, setup/reinstall and exports\n'

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2.3.2"
+SCRIPT_VERSION="2.3.3"
 STATE_DIR="/opt/xhttp-node"
 STATE_FILE="$STATE_DIR/state.env"
 WEBROOT="$STATE_DIR/www"
@@ -12,6 +12,8 @@ NGINX_SITE="/etc/nginx/sites-available/xhttp-node.conf"
 NGINX_LINK="/etc/nginx/sites-enabled/xhttp-node.conf"
 NGINX_SNIPPET="/etc/nginx/snippets/xhttp-node-proxy.conf"
 NGINX_CONF_DIR="/etc/nginx/conf.d"
+NGINX_LOG_DIR="/var/log/xhttp-node"
+NGINX_LOG_FORMAT="$NGINX_CONF_DIR/xhttp-node-logging.conf"
 NODE_DIR="/opt/remnanode"
 LEGACY_WEBROOT_BASE="/var/www"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -464,7 +466,7 @@ backup_legacy_cdn() {
 
 stop_legacy_cdn_units() {
   local unit
-  for unit in xhttp-node-nginx-recover xhttp-node-cert-sync node-ram-watchdog; do
+  for unit in xhttp-node-logrotate xhttp-node-nginx-recover xhttp-node-cert-sync node-ram-watchdog; do
     if [[ -e "$SYSTEMD_DIR/$unit.timer" ]]; then
       systemctl disable --now "$unit.timer" || return 1
     fi
@@ -539,6 +541,7 @@ stop_nginx_recovery() {
 
 write_nginx() {
   install -d -m 755 "$(dirname "$NGINX_SNIPPET")" "$(dirname "$NGINX_SITE")" "$(dirname "$NGINX_LINK")"
+  write_nginx_logging || return 1
   local server_names="$DOMAIN" listeners
   listeners="$(nginx_tls_listeners)" || return 1
   [[ "$ORIGIN_HOST" != "$DOMAIN" ]] && server_names+=" $ORIGIN_HOST"
@@ -571,8 +574,8 @@ $listeners
     ssl_session_tickets off;
     root $WEBROOT;
     index index.html;
-    access_log /var/log/nginx/xhttp-node.access.log;
-    error_log /var/log/nginx/xhttp-node.error.log warn;
+    access_log $NGINX_LOG_DIR/access.log xhttp_node buffer=64k flush=5s;
+    error_log $NGINX_LOG_DIR/error.log warn;
 
     location = /healthz {
         default_type text/plain;
@@ -741,22 +744,103 @@ EOF
   systemctl enable --now node-ram-watchdog.timer
 }
 
+write_nginx_logging() {
+  install -d -m 755 "$NGINX_LOG_DIR" "$(dirname "$NGINX_LOG_FORMAT")" || return 1
+  backup_file "$NGINX_LOG_FORMAT" >/dev/null || return 1
+  # Do not record query/session IDs, Referer padding, or User-Agent per packet.
+  cat > "$NGINX_LOG_FORMAT" <<'EOF'
+# Managed by xhttp-node.sh: compact request logs, no query or Referer.
+log_format xhttp_node '$remote_addr [$time_local] "$request_method $uri" '
+                     '$status $body_bytes_sent rt=$request_time '
+                     'upstream=$upstream_status urt=$upstream_response_time';
+EOF
+}
+
 write_logrotate() {
-  cat > /etc/logrotate.d/xhttp-node <<EOF
-/var/log/nginx/xhttp-node*.log {
-    daily
-    size 50M
-    rotate 7
+  local staging
+  install -d -m 755 "$NGINX_LOG_DIR" "$(dirname "$LOGROTATE_FILE")" "$SYSTEMD_DIR" || return 1
+  staging="$(mktemp "$(dirname "$LOGROTATE_FILE")/.xhttp-logrotate.XXXXXX")" || return 1
+  cat > "$staging" <<EOF
+# Managed by xhttp-node.sh; outside /var/log/nginx/*.log to avoid duplicate rules.
+$NGINX_LOG_DIR/*.log {
+    hourly
+    maxsize 20M
+    rotate 6
     missingok
     notifempty
     compress
-    delaycompress
+    nodelaycompress
+    create 0640 www-data adm
+    su root adm
     sharedscripts
     postrotate
-        systemctl reload nginx >/dev/null 2>&1 || true
+        if [ -s /run/nginx.pid ]; then
+            kill -USR1 "\$(cat /run/nginx.pid)"
+        fi
     endscript
 }
 EOF
+  if ! logrotate -d "$staging" >/dev/null 2>&1; then
+    rm -f -- "$staging"
+    warn "Logrotate config test thất bại; giữ rule cũ."
+    return 1
+  fi
+  backup_file "$LOGROTATE_FILE" >/dev/null || { rm -f -- "$staging"; return 1; }
+  install -m 644 "$staging" "$LOGROTATE_FILE" || { rm -f -- "$staging"; return 1; }
+  rm -f -- "$staging"
+  cat > "$SYSTEMD_DIR/xhttp-node-logrotate.service" <<EOF
+[Unit]
+Description=Rotate bounded XHTTP logs
+After=nginx.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate $LOGROTATE_FILE
+# Exit 3 means the shared global logrotate state is already locked.
+SuccessExitStatus=3
+TimeoutStartSec=180
+Nice=10
+IOSchedulingClass=idle
+EOF
+  cat > "$SYSTEMD_DIR/xhttp-node-logrotate.timer" <<'EOF'
+[Unit]
+Description=Check XHTTP log size every five minutes
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload || return 1
+  systemctl enable --now xhttp-node-logrotate.timer || return 1
+}
+
+repair_logging() {
+  require_root
+  load_state
+  [[ -s "$STATE_FILE" && -s "$NGINX_SITE" ]] || { warn "Cần setup node trước."; return 1; }
+  [[ ! -L "$NGINX_SITE" ]] && grep -q '^# Managed by xhttp-node.sh ' "$NGINX_SITE" || return 1
+  local backup item timer_was_active=false
+  if systemctl is-active --quiet xhttp-node-logrotate.timer; then timer_was_active=true; fi
+  backup="$(backup_cdn_managed)" || return 1
+  log "Backup cấu hình logging: $backup"
+  if ! write_logrotate || ! write_nginx || ! apply_nginx_service; then
+    for item in "$LOGROTATE_FILE" "$NGINX_SITE" "$NGINX_SNIPPET" "$NGINX_LOG_FORMAT" \
+      "$SYSTEMD_DIR/xhttp-node-logrotate.service" "$SYSTEMD_DIR/xhttp-node-logrotate.timer"; do
+      if [[ -e "$backup$item" ]]; then cp -a "$backup$item" "$item" || return 1
+      else rm -f -- "$item" || return 1; fi
+    done
+    systemctl disable --now xhttp-node-logrotate.timer >/dev/null 2>&1 || true
+    systemctl daemon-reload
+    if "$timer_was_active"; then systemctl enable --now xhttp-node-logrotate.timer; fi
+    nginx -t && systemctl reload nginx
+    warn "Sửa logging thất bại; đã trả cấu hình về. Backup: $backup"
+    return 1
+  fi
+  log "Log tại $NGINX_LOG_DIR; kiểm tra mỗi 5 phút, maxsize 20M, giữ 6 bản nén. Không xóa log cũ."
 }
 
 write_exports() {
@@ -855,6 +939,9 @@ check_status() {
   systemctl --no-pager --full status node-ram-watchdog.timer 2>/dev/null || true
   systemctl --no-pager --full status xhttp-node-cert-sync.timer 2>/dev/null || true
   systemctl --no-pager --full status xhttp-node-nginx-recover.timer 2>/dev/null || true
+  systemctl --no-pager --full status xhttp-node-logrotate.timer 2>/dev/null || true
+  df -h /
+  du -sh "$NGINX_LOG_DIR" 2>/dev/null || true
   if [[ -n "$DOMAIN" && -n "$ORIGIN_TARGET" ]]; then
     if valid_ipv4 "$ORIGIN_TARGET"; then
       curl -ksS --noproxy '*' --resolve "$DOMAIN:443:$ORIGIN_TARGET" --max-time 15 -D - -o /dev/null "https://$DOMAIN/healthz" || true
@@ -870,7 +957,8 @@ backup_managed() {
   install -d -m 700 "$BACKUP_ROOT" || return 1
   stamp="$(mktemp -d "$BACKUP_ROOT/reinstall-$(date +%Y%m%d-%H%M%S).XXXXXX")" || return 1
   for item in "$STATE_DIR" "$NODE_DIR" "$WATCHDOG_STATE_DIR" "$NGINX_SITE" "$NGINX_LINK" \
-    "$NGINX_SNIPPET" "$LOGROTATE_FILE" \
+    "$NGINX_SNIPPET" "$NGINX_LOG_FORMAT" "$LOGROTATE_FILE" \
+    "$SYSTEMD_DIR/xhttp-node-logrotate.service" "$SYSTEMD_DIR/xhttp-node-logrotate.timer" \
     "$SYSTEMD_DIR/node-ram-watchdog.service" "$SYSTEMD_DIR/node-ram-watchdog.timer" \
     "$SYSTEMD_DIR/xhttp-node-cert-sync.service" "$SYSTEMD_DIR/xhttp-node-cert-sync.timer" \
     "$SYSTEMD_DIR/xhttp-node-nginx-recover.service" "$SYSTEMD_DIR/xhttp-node-nginx-recover.timer" \
@@ -886,8 +974,9 @@ backup_cdn_managed() {
   local stamp item
   install -d -m 700 "$BACKUP_ROOT" || return 1
   stamp="$(mktemp -d "$BACKUP_ROOT/cdn-remove-$(date +%Y%m%d-%H%M%S).XXXXXX")" || return 1
-  for item in "$STATE_DIR" "$NGINX_SITE" "$NGINX_LINK" "$NGINX_SNIPPET" \
+  for item in "$STATE_DIR" "$NGINX_SITE" "$NGINX_LINK" "$NGINX_SNIPPET" "$NGINX_LOG_FORMAT" \
     "$LOGROTATE_FILE" "$WATCHDOG_STATE_DIR" \
+    "$SYSTEMD_DIR/xhttp-node-logrotate.service" "$SYSTEMD_DIR/xhttp-node-logrotate.timer" \
     "$SYSTEMD_DIR/node-ram-watchdog.service" "$SYSTEMD_DIR/node-ram-watchdog.timer" \
     "$SYSTEMD_DIR/xhttp-node-cert-sync.service" "$SYSTEMD_DIR/xhttp-node-cert-sync.timer" \
     "$SYSTEMD_DIR/xhttp-node-nginx-recover.service" "$SYSTEMD_DIR/xhttp-node-nginx-recover.timer" \
@@ -926,7 +1015,7 @@ remove_cdn_managed() {
       return 1
     fi
   fi
-  for unit in xhttp-node-nginx-recover xhttp-node-cert-sync node-ram-watchdog; do
+  for unit in xhttp-node-logrotate xhttp-node-nginx-recover xhttp-node-cert-sync node-ram-watchdog; do
     if [[ -e "$SYSTEMD_DIR/$unit.timer" ]]; then
       systemctl disable --now "$unit.timer" || return 1
     fi
@@ -934,10 +1023,10 @@ remove_cdn_managed() {
       systemctl stop "$unit.service" || return 1
     fi
   done
-  rm -f "$NGINX_LINK" "$NGINX_SITE" "$NGINX_SNIPPET" || return 1
+  rm -f "$NGINX_LINK" "$NGINX_SITE" "$NGINX_SNIPPET" "$NGINX_LOG_FORMAT" || return 1
   if command_exists nginx; then
     if ! nginx -t || { systemctl is-active --quiet nginx && ! systemctl reload nginx; }; then
-      for item in "$NGINX_SITE" "$NGINX_LINK" "$NGINX_SNIPPET"; do
+      for item in "$NGINX_SITE" "$NGINX_LINK" "$NGINX_SNIPPET" "$NGINX_LOG_FORMAT"; do
         if [[ -e "$backup$item" || -L "$backup$item" ]]; then
           cp -a "$backup$item" "$item" || return 1
         fi
@@ -948,6 +1037,7 @@ remove_cdn_managed() {
   fi
 
   rm -f "$LOGROTATE_FILE" \
+    "$SYSTEMD_DIR/xhttp-node-logrotate.service" "$SYSTEMD_DIR/xhttp-node-logrotate.timer" \
     "$WATCHDOG_BIN" "$CERT_SYNC_BIN" "$NGINX_RECOVER_BIN" \
     "$SYSTEMD_DIR/node-ram-watchdog.service" "$SYSTEMD_DIR/node-ram-watchdog.timer" \
     "$SYSTEMD_DIR/xhttp-node-cert-sync.service" "$SYSTEMD_DIR/xhttp-node-cert-sync.timer" \
@@ -991,7 +1081,8 @@ clean_managed() {
     mkdir -p "$(dirname "$CERT_DIR")" || return 1
     cp -a "$backup$CERT_DIR" "$CERT_DIR" || return 1
   fi
-  rm -f "$NGINX_LINK" "$NGINX_SITE" "$NGINX_SNIPPET" "$LOGROTATE_FILE" \
+  rm -f "$NGINX_LINK" "$NGINX_SITE" "$NGINX_SNIPPET" "$NGINX_LOG_FORMAT" "$LOGROTATE_FILE" \
+    "$SYSTEMD_DIR/xhttp-node-logrotate.service" "$SYSTEMD_DIR/xhttp-node-logrotate.timer" \
     "$SYSTEMD_DIR/node-ram-watchdog.service" "$SYSTEMD_DIR/node-ram-watchdog.timer" \
     "$SYSTEMD_DIR/xhttp-node-cert-sync.service" "$SYSTEMD_DIR/xhttp-node-cert-sync.timer" \
     "$SYSTEMD_DIR/xhttp-node-nginx-recover.service" "$SYSTEMD_DIR/xhttp-node-nginx-recover.timer" \
@@ -1084,7 +1175,7 @@ write_setup() {
   write_nginx_recovery
   write_cert_sync
   write_watchdog
-  write_logrotate
+  write_logrotate || return 1
   write_exports
   save_state
   check_dns
@@ -1116,6 +1207,7 @@ change_domain_path() {
   prepare_certificate
   write_fake_site
   stop_nginx_recovery
+  write_logrotate || return 1
   write_nginx
   write_nginx_recovery
   write_exports
@@ -1127,7 +1219,7 @@ change_domain_path() {
 print_menu() {
   printf '\nXHTTP Node Manager v%s\n' "$SCRIPT_VERSION"
   PS3='Chọn số: '
-  select action in "Setup / rebuild VPS" "Reinstall sạch (backup rồi xóa managed)" "Đổi CDN/domain/origin/path" "Kiểm tra node" "Kiểm tra file và JSON" "Xuất Host Extra" "Cài/cập nhật watchdog" "Tạo / đổi web giả (chọn template)" "Gỡ CDN, giữ node thường" "Thoát"; do
+  select action in "Setup / rebuild VPS" "Reinstall sạch (backup rồi xóa managed)" "Đổi CDN/domain/origin/path" "Kiểm tra node" "Kiểm tra file và JSON" "Xuất Host Extra" "Cài/cập nhật watchdog" "Tạo / đổi web giả (chọn template)" "Gỡ CDN, giữ node thường" "Sửa logging / logrotate (giữ node)" "Thoát"; do
     case "$REPLY" in
       1) write_setup; break ;;
       2) reinstall_clean; break ;;
@@ -1138,7 +1230,8 @@ print_menu() {
       7) require_root; load_state; write_watchdog; log "Watchdog: RAM ${RAM_THRESHOLD}%, mỗi phút, cooldown ${COOLDOWN}s, chỉ restart remnanode"; break ;;
       8) web_template_menu; break ;;
       9) remove_cdn_managed; break ;;
-      10) exit 0 ;;
+      10) repair_logging; break ;;
+      11) exit 0 ;;
       *) warn "Lựa chọn không hợp lệ" ;;
     esac
   done

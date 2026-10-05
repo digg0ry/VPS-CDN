@@ -38,6 +38,7 @@ fixture() {
   NODE_DIR="$BASE/remnanode" WATCHDOG_STATE_DIR="$BASE/watchdog-state"
   NGINX_SITE="$BASE/sites-available/xhttp-node.conf" NGINX_LINK="$BASE/sites-enabled/xhttp-node.conf"
   NGINX_SNIPPET="$BASE/proxy.conf" NGINX_CONF_DIR="$BASE/conf.d"
+  NGINX_LOG_DIR="$BASE/logs" NGINX_LOG_FORMAT="$NGINX_CONF_DIR/xhttp-node-logging.conf"
   SYSTEMD_DIR="$BASE/systemd" BACKUP_ROOT="$BASE/backups"
   LEGACY_WEBROOT_BASE="$BASE/legacy-www"
   WATCHDOG_BIN="$BASE/watchdog" CERT_SYNC_BIN="$BASE/sync" NGINX_RECOVER_BIN="$BASE/recover"
@@ -57,8 +58,8 @@ fixture() {
   printf 'keep cert\n' > "$CERT_DIR/fullchain.pem"
   printf 'keep key\n' > "$CERT_DIR/privkey.pem"
   touch "$STATE_FILE" "$WEBROOT/index.html" "$WATCHDOG_STATE_DIR/last-restart" \
-    "$NGINX_SNIPPET" "$LOGROTATE_FILE" "$WATCHDOG_BIN" "$CERT_SYNC_BIN" "$NGINX_RECOVER_BIN"
-  for unit in xhttp-node-nginx-recover xhttp-node-cert-sync node-ram-watchdog; do
+    "$NGINX_SNIPPET" "$LOGROTATE_FILE" "$NGINX_LOG_FORMAT" "$WATCHDOG_BIN" "$CERT_SYNC_BIN" "$NGINX_RECOVER_BIN"
+  for unit in xhttp-node-logrotate xhttp-node-nginx-recover xhttp-node-cert-sync node-ram-watchdog; do
     touch "$SYSTEMD_DIR/$unit.timer" "$SYSTEMD_DIR/$unit.service"
   done
   ACTIVE=active STOP_RC=0 DOCKER_STOP_RC=0 DOCKER_RM_RC=0
@@ -79,6 +80,8 @@ backup=$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d)
 [[ ! -f "$NGINX_CONF_DIR/cdn-xhttp-upstream.conf" && ! -f "$NGINX_CONF_DIR/cdn-log-format.conf" ]]
 [[ ! -L "$(dirname "$NGINX_LINK")/old.example.com" && ! -e "$(dirname "$NGINX_SITE")/old.example.com" ]]
 [[ -s "$CERT_DIR/fullchain.pem" && -f "$NGINX_CONF_DIR/cdn-unrelated.conf" ]]
+[[ ! -e "$NGINX_LOG_FORMAT" && ! -e "$SYSTEMD_DIR/xhttp-node-logrotate.timer" ]]
+grep -q '^systemctl disable --now xhttp-node-logrotate.timer$' "$CALLS"
 [[ "$ACTIVE" == inactive ]]
 grep -q '^docker stop -t 20 remnanode$' "$CALLS"
 grep -q '^docker rm remnanode$' "$CALLS"

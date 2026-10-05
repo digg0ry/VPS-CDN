@@ -31,6 +31,7 @@ fixture() {
   NGINX_SITE="$BASE/sites-available/site"
   NGINX_LINK="$BASE/sites-enabled/site"
   NGINX_SNIPPET="$BASE/snippet"
+  NGINX_LOG_DIR="$BASE/logs" NGINX_LOG_FORMAT="$BASE/log-format.conf"
   LOGROTATE_FILE="$BASE/logrotate"
   WATCHDOG_STATE_DIR="$BASE/watchdog-state"
   SYSTEMD_DIR="$BASE/systemd"
@@ -44,13 +45,13 @@ fixture() {
   ln -s "$NGINX_SITE" "$NGINX_LINK"
   printf 'secret compose unchanged\n' > "$BASE/remnanode/docker-compose.yml"
   printf 'unrelated server\n' > "$(dirname "$NGINX_LINK")/other"
-  for unit in node-ram-watchdog xhttp-node-cert-sync xhttp-node-nginx-recover; do
+  for unit in xhttp-node-logrotate node-ram-watchdog xhttp-node-cert-sync xhttp-node-nginx-recover; do
     touch "$SYSTEMD_DIR/$unit.service" "$SYSTEMD_DIR/$unit.timer"
   done
   printf 'keep certificate\n' > "$CERT_DIR/fullchain.pem"
   printf 'keep key\n' > "$CERT_DIR/privkey.pem"
   touch "$STATE_FILE" "$WEBROOT/index.html" "$EXPORT_DIR/client.json" \
-    "$NGINX_SNIPPET" "$LOGROTATE_FILE" "$WATCHDOG_BIN" "$CERT_SYNC_BIN" "$NGINX_RECOVER_BIN" \
+    "$NGINX_SNIPPET" "$NGINX_LOG_FORMAT" "$LOGROTATE_FILE" "$WATCHDOG_BIN" "$CERT_SYNC_BIN" "$NGINX_RECOVER_BIN" \
     "$WATCHDOG_STATE_DIR/last-restart"
   : > "$CALLS"
   ACTIVE=true NGINX_RC=0 RELOAD_RC=0 STOP_RC=0
@@ -73,6 +74,7 @@ remove_cdn_managed <<< 'REMOVE-CDN'
 [[ ! -e "$STATE_FILE" && ! -e "$WEBROOT" && ! -e "$EXPORT_DIR" ]]
 [[ ! -e "$CERT_SYNC_BIN" && ! -e "$NGINX_RECOVER_BIN" && ! -e "$WATCHDOG_BIN" ]]
 [[ ! -e "$SYSTEMD_DIR/xhttp-node-nginx-recover.timer" ]]
+[[ ! -e "$NGINX_LOG_FORMAT" && ! -e "$SYSTEMD_DIR/xhttp-node-logrotate.timer" ]]
 grep -q '^reload nginx$' "$CALLS"
 assert_preserved
 backup="$(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d)"

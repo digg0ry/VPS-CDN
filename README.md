@@ -126,5 +126,35 @@ ss -ltnp | grep -E ':(443|7443)\b'
 - `/opt/xhttp-node/exports/host-config.json`
 - `/etc/nginx/sites-available/xhttp-node.conf`
 - `/usr/local/sbin/node-ram-watchdog`
+- `/var/log/xhttp-node/access.log` và `/var/log/xhttp-node/error.log`
+- `/etc/nginx/conf.d/xhttp-node-logging.conf`
+- `/etc/logrotate.d/xhttp-node`
+- `/etc/systemd/system/xhttp-node-logrotate.timer`
+
+## Logging từ 2.3.3
+
+Install, Reinstall và đổi domain/path tự cài logging mới. Log XHTTP nằm riêng trong
+`/var/log/xhttp-node/`, không trùng wildcard `/var/log/nginx/*.log` của gói Nginx.
+Access log dùng format gọn, buffer 64 KiB/flush 5 giây, chỉ ghi IP, thời gian,
+method, URI **không có query**, status, số byte và thời gian/upstream. Không ghi
+session trong query, Referer padding hoặc User-Agent cho từng packet.
+
+Timer `xhttp-node-logrotate.timer` kiểm tra mỗi 5 phút. Rule dùng `hourly`,
+`maxsize 20M`, giữ 6 bản, nén ngay (`nodelaycompress`). `maxsize` được kiểm tra
+khi timer chạy, không phải giới hạn cứng tại thời điểm ghi. Rotation gửi `USR1`
+để Nginx mở lại file, không reload config hoặc restart `remnanode`. Timer riêng
+và logrotate hệ thống dùng cùng state/lock mặc định để tránh chạy đồng thời.
+
+Node đã cài: cập nhật script rồi chọn **10) Sửa logging / logrotate (giữ node)**.
+Mục này backup và chuyển cấu hình logging, không đổi domain/path/cert, Host Extra,
+profile hay container. Giữ các log cũ trong `/var/log/nginx/`; không tự xóa dữ liệu
+khi Install/Reinstall hoặc sửa logging. Nếu disk đã đầy, giữ mẫu cần thiết và dọn
+đúng file log cũ trước. Không copy toàn bộ log nhiều GB vào backup cùng disk.
+
+```bash
+systemctl status xhttp-node-logrotate.timer --no-pager
+logrotate -d /etc/logrotate.conf
+du -sh /var/log/xhttp-node /var/log/nginx
+```
 
 Nếu không tìm thấy cert hợp lệ cho domain, script tạo self-signed cert để Nginx chạy. Khi đó phải tắt kiểm tra certificate origin trên CDN. Cert có sẵn ở `/opt/certbot/certs/live/DOMAIN/` hoặc `/etc/letsencrypt/live/DOMAIN/` sẽ được tự phát hiện và đồng bộ vào `/opt/xhttp-node/certs/`.
