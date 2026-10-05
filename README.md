@@ -104,7 +104,39 @@ Timer cũng bật lại Nginx sau khi bạn chủ động stop. Khi bảo trì, 
 Nginx active không chứng minh VPN chạy: vẫn cần kiểm tra listener XHTTP và test qua CDN.
 Không cần reinstall chỉ để bật Nginx sau khi đổi cổng trên panel.
 
-Menu **9) Gỡ CDN, giữ node thường** gỡ Nginx origin, web giả, exports,
+## Gỡ CDN hoặc xóa bộ CDN + Nginx + Remnanode
+
+Từ `2.3.5`, menu **9) Gỡ CDN / xóa CDN + Nginx + Remnanode** mở hai lựa chọn riêng.
+
+### Xóa bộ CDN + toàn bộ Nginx + Remnanode
+
+**Thao tác này dừng VPN và mọi website Nginx trên VPS đang chạy script. Không phải reinstall OS.**
+
+1. Cập nhật script từ GitHub và mở menu trên đúng VPS cần dọn.
+2. Chọn **9**, rồi **1) Xóa bộ CDN + toàn bộ Nginx + Remnanode (backup trước)**.
+3. Nếu phát hiện `/opt/caddy` hoặc container `caddy-selfsteal`, chọn có/không xóa thêm chúng. Nếu có `/opt/certbot`, chọn có/không xóa toàn bộ kho cert đó. Hai câu hỏi mặc định **không**; kiểm tra cert dùng chung trước khi chọn có.
+4. Kiểm tra hostname/IP, danh sách đường dẫn, container và gói sắp xóa. Gõ chính xác `REMOVE-STACK@HOSTNAME` theo prompt. Enter hoặc chữ khác sẽ hủy.
+5. Script backup trước, dừng timer/dịch vụ/container, purge gói Nginx, xóa container và dữ liệu được liệt kê, rồi kiểm tra lại. Sau đó có thể chọn **1) Setup** để tạo node mới.
+
+Danh sách dọn gồm:
+
+- toàn bộ `/etc/nginx`, gói `nginx`, `nginx-*`, `libnginx-mod-*` và plugin `python3-certbot-nginx` đã cài;
+- `/var/log/nginx`, `/var/cache/nginx`, `/var/lib/nginx`, `/var/log/xhttp-node`, `/var/log/remnanode`;
+- container `remnanode`, `/opt/remnanode`, `/opt/xhttp-node` (gồm cert copy, web, exports, state), `/var/lib/xhttp-node`;
+- watchdog, cert-sync, nginx-recover, logrotate và unit/timer của script; unit `remnanode.service` nếu có;
+- webroot CDN cũ dưới `/var/www/DOMAIN` được nhận diện bằng cấu hình managed/upstream cũ; không xóa toàn bộ `/var/www`;
+- nếu chọn thêm: `caddy-selfsteal` cùng `/opt/caddy`; `/opt/certbot` cùng container image `certbot/certbot` có bind mount tới kho đó;
+- image Remnanode và image của container đã chọn khi không được container khác sử dụng; không force, không chạy `docker prune` hoặc `apt autoremove`.
+
+Giữ OS, SSH, Docker Engine, container/dữ liệu không liên quan, trình quản lý `xhttp-node`, backup cũ/mới, cert bên ngoài danh sách (ví dụ `/etc/letsencrypt`), journal hệ thống và panel Remnawave. Script không sửa DNS/resource CDN hoặc panel từ xa. Nginx bị gỡ **toàn bộ**, kể cả site không do script tạo; backup `/etc/nginx` trước khi gỡ, nhưng webroot ngoài danh sách được giữ.
+
+Backup nằm trong `/var/backups/xhttp-node/stack-remove-*`, thư mục quyền `700`. Có config, cert/web trong đường dẫn chọn xóa, metadata container (có thể chứa secret, quyền `600`), danh sách gói và đường dẫn. Không copy các thư mục log/cache/runtime Nginx đã liệt kê; không backup image, Docker volume hay dữ liệu writable bên trong container. Sao lưu dữ liệu quan trọng ra ngoài VPS trước khi xác nhận.
+
+Preflight dừng khi Docker không phản hồi, đường dẫn xóa có symlink, container khác mount chung thư mục, container chọn xóa có named volume/image không đúng, Nginx không do APT quản lý hoặc APT định gỡ thêm gói ngoài Nginx. Backup/stop lỗi thì giữ file/container. Nếu purge/removal thất bại giữa chừng, script báo lỗi và backup; dịch vụ có thể đã dừng, không tự rollback toàn bộ hoặc báo sạch thành công. Phục hồi cần cài lại gói, khôi phục config/cert và tạo lại container từ compose/metadata trong backup; log/cache đã xóa không có bản phục hồi.
+
+### Chỉ gỡ CDN, giữ node thường
+
+Menu **9**, lựa chọn **2) Chỉ gỡ CDN, giữ node thường** gỡ Nginx origin, web giả, exports,
 logrotate, watchdog và timer do script quản lý. Script backup trước khi xóa, giữ
 `remnanode`, toàn bộ cert (kể cả `/opt/xhttp-node/certs`), `/opt/certbot`, Docker và dịch vụ khác. Sau đó đổi Config Profile
 trên Remnawave về inbound node thường; panel không được script sửa.

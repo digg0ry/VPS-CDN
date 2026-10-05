@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2.3.4"
+SCRIPT_VERSION="2.3.5"
 STATE_DIR="/opt/xhttp-node"
 STATE_FILE="$STATE_DIR/state.env"
 WEBROOT="$STATE_DIR/www"
@@ -23,6 +23,13 @@ WATCHDOG_BIN="/usr/local/sbin/node-ram-watchdog"
 CERT_SYNC_BIN="/usr/local/sbin/xhttp-node-cert-sync"
 NGINX_RECOVER_BIN="/usr/local/sbin/xhttp-node-nginx-recover"
 BACKUP_ROOT="/var/backups/xhttp-node"
+NGINX_ROOT="/etc/nginx"
+NGINX_SYSTEM_LOG_DIR="/var/log/nginx"
+NGINX_CACHE_DIR="/var/cache/nginx"
+NGINX_LIB_DIR="/var/lib/nginx"
+NODE_LOG_DIR="/var/log/remnanode"
+CADDY_DIR="/opt/caddy"
+CERTBOT_DIR="/opt/certbot"
 DEFAULT_PATH="/api/v4/telemetry/collect/"
 DEFAULT_XHTTP_PORT="7443"
 DEFAULT_NODE_PORT="34534"
@@ -1119,6 +1126,219 @@ remove_cdn_managed() {
   ss -ltnp '( sport = :80 or sport = :443 or sport = :7443 )' || true
 }
 
+nginx_package() {
+  [[ "$1" =~ ^(nginx(-[a-z0-9-]+)?|libnginx-mod-[a-z0-9-]+|python3-certbot-nginx)(:[a-z0-9-]+)?$ ]]
+}
+
+remove_stack_paths() {
+  local item target
+  REMOVE_STACK_PATHS=("$STATE_DIR" "$NODE_DIR" "$WATCHDOG_STATE_DIR" "$NGINX_ROOT"
+    "$NGINX_LOG_DIR" "$NGINX_SYSTEM_LOG_DIR" "$NGINX_CACHE_DIR" "$NGINX_LIB_DIR" "$NODE_LOG_DIR"
+    "$LOGROTATE_FILE" "$WATCHDOG_BIN" "$CERT_SYNC_BIN" "$NGINX_RECOVER_BIN"
+    "$(dirname "$LOGROTATE_FILE")/nginx" "$(dirname "$LOGROTATE_FILE")/remnanode"
+    "$SYSTEMD_DIR/nginx.service" "$SYSTEMD_DIR/nginx.service.d" "$SYSTEMD_DIR/remnanode.service")
+  for item in xhttp-node-logrotate xhttp-node-nginx-recover xhttp-node-cert-sync node-ram-watchdog; do
+    REMOVE_STACK_PATHS+=("$SYSTEMD_DIR/$item.service" "$SYSTEMD_DIR/$item.timer")
+  done
+  [[ "$REMOVE_CADDY" != true ]] || REMOVE_STACK_PATHS+=("$CADDY_DIR")
+  [[ "$REMOVE_CERTBOT" != true ]] || REMOVE_STACK_PATHS+=("$CERTBOT_DIR")
+  legacy_cdn_paths || return 1
+  # Nginx config paths are already covered by NGINX_ROOT. Keep only identified webroots.
+  for item in "${LEGACY_CDN_PATHS[@]}"; do
+    [[ "$item" != "$LEGACY_WEBROOT_BASE/"* ]] || REMOVE_STACK_PATHS+=("$item")
+  done
+  for item in "${REMOVE_STACK_PATHS[@]}"; do
+    [[ "$item" == /*/* && "$item" != *'/../'* && "$item" != *'/./'* && "$item" != *'//'* ]] || return 1
+    case "${item%/}" in
+      /etc|/opt|/var|/usr|/root|/home|/var/log|/var/cache|/var/lib|/etc/systemd|/etc/systemd/system|/etc/logrotate.d)
+        warn "Đường dẫn quá rộng: $item"; return 1 ;;
+    esac
+    # Tree symlinks (including ancestor symlinks) must never expand the deletion scope.
+    if [[ -e "$item" || -L "$item" ]]; then
+      if [[ -L "$item" || "$(readlink -f "$item")" != "$item" ]]; then
+        warn "Đường dẫn xóa có symlink; cần kiểm tra trước: $item"
+        return 1
+      fi
+    fi
+    target="${item%/}"
+    [[ "$BACKUP_ROOT" != "$target" && "$BACKUP_ROOT" != "$target/"* ]] || return 1
+  done
+}
+
+remove_full_stack() {
+  require_root
+  local answer machine graph='[]' ids_text item package status plan backup load_state paths_json selected_json
+  local REMOVE_CADDY=false REMOVE_CERTBOT=false
+  local -a ids=() packages=() containers=() images=()
+  machine="$(hostname)" || return 1
+  printf '\nXóa bộ CDN + toàn bộ Nginx + Remnanode trên máy: %s\n' "$machine"
+  ip -brief address 2>/dev/null || true
+  printf 'VPN và mọi website Nginx trên máy này sẽ dừng. OS, SSH và Docker được giữ.\n'
+  printf 'Backup config/cert/web trước khi xóa; log/cache bị xóa, không copy vào backup.\n'
+  printf 'Panel Remnawave, DNS/resource CDN bên ngoài và container khác không bị xóa.\n'
+  command_exists apt-get && command_exists dpkg-query && command_exists jq && command_exists pgrep || {
+    warn "Cần apt-get, dpkg-query, jq và pgrep để kiểm tra trước khi xóa."; return 1;
+  }
+  if command_exists docker; then
+    docker info >/dev/null 2>&1 || { warn "Docker không phản hồi; chưa dừng/xóa gì."; return 1; }
+    ids_text="$(docker ps --no-trunc -aq)" || return 1
+    while IFS= read -r item; do [[ -z "$item" ]] || ids+=("$item"); done <<< "$ids_text"
+    if ((${#ids[@]})); then graph="$(docker inspect "${ids[@]}")" || return 1; fi
+    jq -e 'type == "array" and all(.[]; (.Name | type == "string") and (.Mounts | type == "array"))' <<< "$graph" >/dev/null || return 1
+    while IFS= read -r item; do [[ -z "$item" ]] || containers+=("$item"); done < <(
+      jq -r '.[] | select(.Name == "/remnanode") | .Id' <<< "$graph")
+  fi
+  if [[ -e "$CADDY_DIR" || -L "$CADDY_DIR" ]] || jq -e 'any(.[]; .Name == "/caddy-selfsteal")' <<< "$graph" >/dev/null; then
+    read -r -p "Xóa thêm caddy-selfsteal và $CADDY_DIR (toàn bộ cert/web bên trong)? [y/N]: " answer || return 0
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+      REMOVE_CADDY=true
+      while IFS= read -r item; do [[ -z "$item" ]] || containers+=("$item"); done < <(
+        jq -r '.[] | select(.Name == "/caddy-selfsteal") | .Id' <<< "$graph")
+    fi
+  fi
+  if [[ -e "$CERTBOT_DIR" || -L "$CERTBOT_DIR" ]]; then
+    read -r -p "Xóa toàn bộ $CERTBOT_DIR, gồm cert của mọi domain bên trong? [y/N]: " answer || return 0
+    [[ ! "$answer" =~ ^[Yy]$ ]] || REMOVE_CERTBOT=true
+  fi
+  if [[ "$REMOVE_CERTBOT" == true ]]; then
+    while IFS= read -r item; do [[ -z "$item" ]] || containers+=("$item"); done < <(
+      jq -r --arg dir "$CERTBOT_DIR" '.[] | select((.Config.Image | test("^certbot/certbot(:|@|$)")) and
+        any(.Mounts[]; .Type == "bind" and (.Source == $dir or (.Source | startswith($dir + "/"))))) | .Id' <<< "$graph")
+  fi
+  selected_json="$(jq -n '$ARGS.positional' --args "${containers[@]}")" || return 1
+  if ! jq -e --argjson ids "$selected_json" '
+    all(.[] | .Id as $id | select($ids | index($id));
+      (if .Name == "/remnanode" then (.Config.Image | test("^(remnawave/node|ghcr.io/remnawave/node)(:|@|$)"))
+       elif .Name == "/caddy-selfsteal" then (.Config.Image | test("^(caddy|ghcr.io/caddyserver/caddy)(:|@|$)"))
+       else (.Config.Image | test("^certbot/certbot(:|@|$)")) end) and
+      all(.Mounts[]; .Type != "volume"))' <<< "$graph" >/dev/null; then
+    warn "Container chọn xóa dùng image khác dự kiến hoặc named volume; cần kiểm tra/sao lưu volume trước. Chưa dừng/xóa gì."
+    return 1
+  fi
+  if command_exists docker; then
+    ids_text="$(docker image ls --filter reference=remnawave/node --filter reference=ghcr.io/remnawave/node --format '{{.Repository}}:{{.Tag}}')" || return 1
+    while IFS= read -r item; do [[ -z "$item" || "$item" == *':<none>' ]] || images+=("$item"); done <<< "$ids_text"
+    while IFS= read -r item; do [[ -z "$item" ]] || images+=("$item"); done < <(
+      jq -r --argjson ids "$selected_json" '.[] | .Id as $id | select($ids | index($id)) | .Config.Image' <<< "$graph" | sort -u)
+    ids=()
+    while IFS= read -r item; do [[ -z "$item" ]] || ids+=("$item"); done < <(printf '%s\n' "${images[@]}" | sort -u)
+    images=("${ids[@]}")
+  fi
+  remove_stack_paths || { warn "Danh sách xóa chưa hợp lệ; chưa dừng/xóa gì."; return 1; }
+  paths_json="$(printf '%s\n' "${REMOVE_STACK_PATHS[@]}" | jq -Rs 'split("\n")[:-1]')" || return 1
+  # Protect bind mounts belonging to unrelated containers, including stopped containers.
+  if ! jq -e --argjson paths "$paths_json" --argjson ids "$selected_json" '
+    all(.[] | .Id as $id | select(($ids | index($id)) == null);
+      all(.Mounts[] | select(.Type == "bind"); .Source as $s |
+        all($paths[]; . as $p | ($s != $p and ($s | startswith($p + "/") | not) and ($p | startswith($s + "/") | not)))))
+    ' <<< "$graph" >/dev/null; then
+    warn "Container giữ lại đang mount thư mục cần xóa; chưa dừng/xóa gì. Kiểm tra docker inspect trước."
+    return 1
+  fi
+  ids_text="$(dpkg-query -W -f='${binary:Package} ${db:Status-Status}\n')" || return 1
+  while read -r package status; do
+    if nginx_package "$package" && [[ "$status" == installed || "$status" == config-files ]]; then packages+=("$package"); fi
+  done <<< "$ids_text"
+  if ((${#packages[@]} == 0)) && command_exists nginx; then
+    warn "Nginx không do APT quản lý; cần kiểm tra binary trước. Chưa dừng/xóa gì."
+    return 1
+  fi
+  if ((${#packages[@]})); then
+    plan="$(LC_ALL=C apt-get -s purge "${packages[@]}")" || return 1
+    while read -r status package item; do
+      if [[ "$status" == Remv || "$status" == Purg ]] && ! nginx_package "$package"; then
+        warn "APT định gỡ gói ngoài Nginx: $package. Chưa dừng/xóa gì."
+        return 1
+      fi
+    done <<< "$plan"
+  fi
+  printf 'Đường dẫn sẽ xóa:\n'; printf '  %s\n' "${REMOVE_STACK_PATHS[@]}"
+  printf 'Gói Nginx sẽ purge:'; printf ' %s' "${packages[@]}"; printf '\n'
+  printf 'Container sẽ xóa:\n'
+  jq -r --argjson ids "$selected_json" '.[] | .Id as $id | select($ids | index($id)) | "  " + .Name' <<< "$graph"
+  printf 'Image liên quan sẽ gỡ nếu không bị container khác dùng:'; printf ' %s' "${images[@]}"; printf '\n'
+  printf 'Giữ backup tại %s; giữ cert bên ngoài danh sách trên và Docker của dịch vụ khác.\n' "$BACKUP_ROOT"
+  read -r -p "Gõ REMOVE-STACK@$machine để xác nhận xóa trên máy này: " answer || return 0
+  [[ "$answer" == "REMOVE-STACK@$machine" ]] || { warn "Đã hủy."; return 0; }
+  [[ ! -L "$BACKUP_ROOT" ]] || return 1
+  install -d -m 700 "$BACKUP_ROOT" || return 1
+  [[ "$(readlink -f "$BACKUP_ROOT")" == "$BACKUP_ROOT" ]] || return 1
+  backup="$(mktemp -d "$BACKUP_ROOT/stack-remove-$(date +%Y%m%d-%H%M%S).XXXXXX")" || return 1
+  for item in "${REMOVE_STACK_PATHS[@]}"; do
+    case "$item" in "$NGINX_LOG_DIR"|"$NGINX_SYSTEM_LOG_DIR"|"$NGINX_CACHE_DIR"|"$NGINX_LIB_DIR"|"$NODE_LOG_DIR") continue ;; esac
+    [[ -e "$item" ]] || continue
+    mkdir -p "$backup$(dirname "$item")" && cp -a "$item" "$backup$item" || {
+      warn "Backup thất bại; chưa dừng/xóa gì. Backup chưa hoàn chỉnh: $backup"; return 1;
+    }
+  done
+  jq --argjson ids "$selected_json" '[.[] | .Id as $id | select($ids | index($id))]' <<< "$graph" > "$backup/containers.json" || return 1
+  printf '%s\n' "${packages[@]}" > "$backup/nginx-packages.txt" || return 1
+  printf '%s\n' "${REMOVE_STACK_PATHS[@]}" > "$backup/removed-paths.txt" || return 1
+  chmod 600 "$backup/containers.json" "$backup/nginx-packages.txt" "$backup/removed-paths.txt" || return 1
+  log "Backup config/cert/web và metadata container: $backup (không chứa log/cache hoặc Docker volumes)."
+  stop_legacy_cdn_units || { warn "Dừng timer thất bại; chưa xóa file/container. Backup: $backup"; return 1; }
+  for item in nginx.service remnanode.service; do
+    load_state="$(systemctl show -p LoadState --value "$item")" || return 1
+    if [[ "$load_state" != not-found ]]; then
+      systemctl disable --now "$item" || { warn "Dừng $item thất bại; chưa xóa file/container. Backup: $backup"; return 1; }
+    fi
+  done
+  # Stop every selected container before deleting any; failure leaves data/config in place.
+  for item in "${containers[@]}"; do docker stop -t 20 "$item" >/dev/null || { warn "Dừng container thất bại; chưa xóa dữ liệu. Backup: $backup"; return 1; }; done
+  if pgrep -x nginx >/dev/null 2>&1; then
+    warn "Tiến trình Nginx vẫn chạy ngoài systemd; chưa purge/xóa dữ liệu. Backup: $backup"
+    return 1
+  fi
+  if ((${#packages[@]})); then
+    DEBIAN_FRONTEND=noninteractive apt-get -y purge "${packages[@]}" || {
+      warn "Purge Nginx thất bại; dịch vụ đang dừng, chưa xóa container/thư mục. Backup: $backup"; return 1;
+    }
+    ids_text="$(dpkg-query -W -f='${binary:Package} ${db:Status-Status}\n')" || return 1
+    while read -r package status; do
+      if nginx_package "$package" && [[ "$status" == installed || "$status" == config-files ]]; then
+        warn "Gói Nginx chưa được purge: $package. Giữ container/thư mục. Backup: $backup"; return 1
+      fi
+    done <<< "$ids_text"
+  fi
+  for item in "${containers[@]}"; do docker rm "$item" >/dev/null || { warn "Xóa container thất bại; giữ thư mục. Backup: $backup"; return 1; }; done
+  for item in "${images[@]}"; do
+    # Never force image removal or prune Docker: other services may share these layers.
+    if jq -e --arg image "$item" --argjson ids "$selected_json" '
+      any(.[]; .Id as $id | ($ids | index($id)) == null and .Config.Image == $image)' <<< "$graph" >/dev/null; then
+      warn "Giữ image dùng chung với container khác: $item"
+    else
+      docker image rm "$item" >/dev/null 2>&1 || warn "Giữ image đang dùng/không gỡ được: $item"
+    fi
+  done
+  for item in "${REMOVE_STACK_PATHS[@]}"; do rm -rf -- "$item" || { warn "Xóa $item thất bại. Backup: $backup"; return 1; }; done
+  systemctl daemon-reload || return 1
+  if systemctl is-active --quiet nginx.service || systemctl is-active --quiet remnanode.service; then
+    warn "Dịch vụ vẫn active; kiểm tra lại. Backup: $backup"; return 1
+  fi
+  if command_exists docker; then
+    ids_text="$(docker ps --no-trunc -aq)" || return 1
+    for item in "${containers[@]}"; do
+      if grep -qxF "$item" <<< "$ids_text"; then warn "Container vẫn tồn tại: $item"; return 1; fi
+    done
+  fi
+  for item in "${REMOVE_STACK_PATHS[@]}"; do [[ ! -e "$item" && ! -L "$item" ]] || return 1; done
+  log "Đã xóa bộ CDN, toàn bộ Nginx và Remnanode trên $machine. Không cài lại OS."
+  warn "Giữ SSH, Docker, image chia sẻ, backup, cert bên ngoài danh sách và dịch vụ khác. Panel/DNS/resource CDN không bị sửa."
+}
+
+remove_stack_menu() {
+  local choice
+  PS3='Chọn số: '
+  select choice in "Xóa bộ CDN + toàn bộ Nginx + Remnanode (backup trước)" "Chỉ gỡ CDN, giữ node thường" "Quay lại"; do
+    case "$REPLY" in
+      1) remove_full_stack; break ;;
+      2) remove_cdn_managed; break ;;
+      3) break ;;
+      *) warn "Lựa chọn không hợp lệ" ;;
+    esac
+  done
+}
+
 clean_managed() {
   require_root
   local backup item recreate_node="${1:-Y}"
@@ -1284,7 +1504,7 @@ change_domain_path() {
 print_menu() {
   printf '\nXHTTP Node Manager v%s\n' "$SCRIPT_VERSION"
   PS3='Chọn số: '
-  select action in "Setup / rebuild VPS" "Reinstall sạch (backup rồi xóa managed)" "Đổi CDN/domain/origin/path" "Kiểm tra node" "Kiểm tra file và JSON" "Xuất Host Extra" "Cài/cập nhật watchdog" "Tạo / đổi web giả (chọn template)" "Gỡ CDN, giữ node thường" "Sửa logging / logrotate (giữ node)" "Thoát"; do
+  select action in "Setup / rebuild VPS" "Reinstall sạch (backup rồi xóa managed)" "Đổi CDN/domain/origin/path" "Kiểm tra node" "Kiểm tra file và JSON" "Xuất Host Extra" "Cài/cập nhật watchdog" "Tạo / đổi web giả (chọn template)" "Gỡ CDN / xóa CDN + Nginx + Remnanode" "Sửa logging / logrotate (giữ node)" "Thoát"; do
     case "$REPLY" in
       1) write_setup; break ;;
       2) reinstall_clean; break ;;
@@ -1294,7 +1514,7 @@ print_menu() {
       6) refresh_exports; cat "$EXPORT_DIR/host-extra.json"; break ;;
       7) require_root; load_state; write_watchdog; log "Watchdog: RAM ${RAM_THRESHOLD}%, mỗi phút, cooldown ${COOLDOWN}s, chỉ restart remnanode"; break ;;
       8) web_template_menu; break ;;
-      9) remove_cdn_managed; break ;;
+      9) remove_stack_menu; break ;;
       10) repair_logging; break ;;
       11) exit 0 ;;
       *) warn "Lựa chọn không hợp lệ" ;;
