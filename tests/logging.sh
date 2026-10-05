@@ -66,6 +66,20 @@ grep -Fq 'OnCalendar=*-*-* *:0/5:00' "$SYSTEMD_DIR/xhttp-node-logrotate.timer"
 grep -Fq "ExecStart=/usr/sbin/logrotate $LOGROTATE_FILE" "$SYSTEMD_DIR/xhttp-node-logrotate.service"
 grep -Fqx 'systemctl enable --now xhttp-node-logrotate.timer' "$CALLS"
 ! grep -qE '\$(request|args|http_referer|http_user_agent)([^_a-z]|$)' "$NGINX_LOG_FORMAT"
+grep -Fq 'map $uri $xhttp_node_log_uri' "$NGINX_LOG_FORMAT"
+grep -Fq '"$request_method $xhttp_node_log_uri"' "$NGINX_LOG_FORMAT"
+grep -Fq '$xhttp_node_base;' "$NGINX_LOG_FORMAT"
+python3 - "$NGINX_LOG_FORMAT" <<'PY'
+import pathlib, re, sys
+text = pathlib.Path(sys.argv[1]).read_text()
+pattern = re.search(r'"~([^"\n]+)" \$xhttp_node_base;', text).group(1)
+pattern = pattern.replace('(?<xhttp_node_base>', '(?P<xhttp_node_base>')
+session = '00000000-0000-4000-8000-000000000001'
+for suffix in (session, session+'/', session+'/12'):
+    match = re.match(pattern, '/base/path/'+suffix)
+    assert match and match.group('xhttp_node_base') == '/base/path/'
+assert not re.match(pattern, '/healthz')
+PY
 grep -q 'unrelated rotation' "$BASE/logrotate.d/nginx"
 cp "$LOGROTATE_FILE" "$BASE/expected"
 write_logrotate

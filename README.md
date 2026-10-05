@@ -30,14 +30,18 @@ Script không tự tạo resource CDN. Cấu hình resource trong dashboard CDN:
 Preset path mặc định:
 
 - Yandex: `/api/v4/media/session/poll2/`;
-- VK: `/api/v4/media/session/poll2/`;
+- VK: `/uploadfiles/`;
 - Beeline: `/xh`.
 
-Từ `2.3.2`, Yandex preset thử `GET + header`, `uplinkChunkSize: "2000-3000"`, `sessionIDKey: "auth"`, `sessionIDPlacement: "query"`, `seqKey: "offset"` và `seqPlacement: "query"`. XMUX dùng `maxConnections: "1"`, không dùng cùng `maxConcurrency`; các giới hạn reuse trong XMUX đặt `"0"`. Buffer 100, payload mỗi packet tối đa 8192 byte, khoảng cách gửi 30 ms, padding `"100-1000"`. VK và Beeline giữ nguyên preset trước đó.
+Từ `2.3.4`, Yandex preset dùng `GET + header`, `sessionIDKey: "media_sid"`, `sessionIDPlacement: "path"`, `seqKey: "offset"` và `seqPlacement: "query"`. Padding trong query: key `q`, bytes `"48-320"`, method `tokenish`, obfuscation bật. XMUX dùng `maxConcurrency: "8-16"`, không đặt `maxConnections`; `cMaxReuseTimes: "128-256"`, `hKeepAlivePeriod: 30`, `hMaxRequestTimes: "600-1000"`, `hMaxReusableSecs: "1800-3600"`. Buffer 64, payload mỗi packet `"1536-6144"` byte, khoảng cách gửi `"10-30"` ms. `uplinkDataKey: "X-Playback-Token"`, `serverMaxHeaderBytes: 32768`; không đặt `uplinkChunkSize` để dùng mặc định header của core. VK và Beeline giữ nguyên preset trước đó.
 
 Đổi session placement/key là đổi framing: phải cập nhật **cả inbound trên Remnawave lẫn Host Extra**, rồi refresh subscription/profile client. Chỉ cập nhật script hoặc file JSON trên VPS không thay inbound đang chạy do panel quản lý. Nên thử trên Host/profile bản sao trước; không cần reinstall, đổi cert, domain hoặc path để thử preset.
 
-`sessionKey` và `sessionPlacement` trong mẫu tham khảo không thuộc schema Xray 26.7.28; bản xuất dùng `sessionIDKey` và `sessionIDPlacement`. Giữ `serverMaxHeaderBytes: 32768` ở inbound vì payload 8192 byte được Base64 thành khoảng 10923 ký tự, chưa tính padding/header khác. `uplinkChunkSize` chia payload đã mã hóa thành từng header `X-Playback-Token-N`, không giới hạn tổng kích thước header của request. `sessionIDTable: ""` dùng UUID mặc định; `sessionIDLength` không tạo ID 16-32 ký tự khi bảng ký tự rỗng. Một kết nối XMUX không đảm bảo nhanh hơn hoặc sửa mọi lỗi CDN.
+`sessionKey` và `sessionPlacement` trong mẫu tham khảo không thuộc schema Xray 26.7.28 và bị parser bỏ qua; placement mặc định của core là `path`. Bản xuất dùng tên hợp lệ `sessionIDKey` và `sessionIDPlacement` để diễn đạt đúng framing đó. Khi session ở path, key `media_sid` không tạo cookie/query parameter. Giữ `serverMaxHeaderBytes: 32768` ở inbound vì payload 6144 byte được Base64 thành 8192 ký tự, chưa tính padding/header khác. `uplinkChunkSize` chia payload đã mã hóa thành từng header `X-Playback-Token-N`, không giới hạn tổng kích thước header của request; mặc định header trên core 26.7.28 là `"3000-4000"`. Không thay domain, path, port, cert, logging hoặc watchdog chỉ để thử preset; `7443` và `10086` đều dùng được nếu Nginx và inbound khớp nhau. XMUX chủ yếu điều khiển phía client; cấu hình inbound không chứng minh Happ đã dùng các giá trị đó. Preset không đảm bảo nhanh hơn trên mọi mạng/CDN.
+
+### Xuất lại preset trên node đã cài
+
+Cập nhật script rồi chọn **6) Xuất Host Extra**. Từ `2.3.4`, mục này backup exports cũ và tạo lại `host-extra.json`, `server-inbound.json`, `client-template.json`, `host-config.json`, `connection-info.json` từ state hiện có. Không reinstall, không thay cert, không reload Nginx hoặc restart container; domain, path và port giữ nguyên. File tại `/opt/xhttp-node/exports/`. Dán server inbound và Host Extra vào profile/Host bản sao trên panel, thay UUID trong client template khi test; sau đó refresh subscription/profile client. Script không tự sửa panel hoặc CDN resource.
 
 VK preset dùng `GET` với padding header riêng. Beeline preset dùng `POST + body`, `downloadHTTPMethod: GET` và cần CDN cho phép POST cùng rewrite đúng path.
 
@@ -136,8 +140,10 @@ ss -ltnp | grep -E ':(443|7443)\b'
 Install, Reinstall và đổi domain/path tự cài logging mới. Log XHTTP nằm riêng trong
 `/var/log/xhttp-node/`, không trùng wildcard `/var/log/nginx/*.log` của gói Nginx.
 Access log dùng format gọn, buffer 64 KiB/flush 5 giây, chỉ ghi IP, thời gian,
-method, URI **không có query**, status, số byte và thời gian/upstream. Không ghi
-session trong query, Referer padding hoặc User-Agent cho từng packet.
+method, URI **không có query**, status, số byte và thời gian/upstream. Từ `2.3.4`,
+UUID session ở cuối path được rút về base path trong log. Không ghi query,
+Referer padding hoặc User-Agent cho từng packet. Logging mới áp dụng khi setup,
+reinstall hoặc chọn mục 10; mục 6 chỉ xuất JSON, không thay Nginx đang chạy.
 
 Timer `xhttp-node-logrotate.timer` kiểm tra mỗi 5 phút. Rule dùng `hourly`,
 `maxsize 20M`, giữ 6 bản, nén ngay (`nodelaycompress`). `maxsize` được kiểm tra
@@ -158,3 +164,19 @@ du -sh /var/log/xhttp-node /var/log/nginx
 ```
 
 Nếu không tìm thấy cert hợp lệ cho domain, script tạo self-signed cert để Nginx chạy. Khi đó phải tắt kiểm tra certificate origin trên CDN. Cert có sẵn ở `/opt/certbot/certs/live/DOMAIN/` hoặc `/etc/letsencrypt/live/DOMAIN/` sẽ được tự phát hiện và đồng bộ vào `/opt/xhttp-node/certs/`.
+
+## Kiểm thử
+
+```bash
+bash -n xhttp-node.sh tests/*.sh
+shellcheck -S error xhttp-node.sh tests/*.sh
+for test in tests/*.sh; do bash "$test"; done
+```
+
+Smoke test tùy chọn cần Python 3 và binary Xray hỗ trợ các trường Extra này:
+
+```bash
+python3 tests/xray-smoke.py --xray /path/to/xray --exports /path/to/exports
+```
+
+Test tạo server/client/HTTP fixture trên loopback, dùng UUID tạm, kiểm tra download/upload 128 KiB và 4 request đồng thời. Cấu hình tạm chỉ cho phép outbound tới đúng HTTP listener của test; không chạm node, panel hay CDN thật. Test loopback không đo tốc độ mạng/CDN và không chứng minh Happ trên mọi máy đã tương thích.

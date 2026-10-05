@@ -38,13 +38,15 @@ for CDN_PROVIDER in yandex vk beeline; do
 done
 
 jq -e '. == {
-  xmux: {cMaxReuseTimes:"0",maxConnections:"1",hKeepAlivePeriod:0,hMaxRequestTimes:"0",hMaxReusableSecs:"0"},
-  seqKey:"offset",seqPlacement:"query",sessionIDKey:"auth",sessionIDPlacement:"query",
-  sessionIDTable:"",sessionIDLength:"16-32",uplinkHTTPMethod:"GET",
-  uplinkDataPlacement:"header",uplinkDataKey:"X-Playback-Token",uplinkChunkSize:"2000-3000",
-  xPaddingBytes:"100-1000",scMaxBufferedPosts:100,scMaxEachPostBytes:8192,
-  scMinPostsIntervalMs:30,serverMaxHeaderBytes:32768
+  xmux: {cMaxReuseTimes:"128-256",maxConcurrency:"8-16",hKeepAlivePeriod:30,hMaxRequestTimes:"600-1000",hMaxReusableSecs:"1800-3600"},
+  seqKey:"offset",seqPlacement:"query",sessionIDKey:"media_sid",sessionIDPlacement:"path",
+  headers:{Accept:"application/vnd.api+json, application/json, text/plain, */*",Pragma:"no-cache","Cache-Control":"no-cache","Accept-Language":"ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"},
+  uplinkHTTPMethod:"GET",uplinkDataPlacement:"header",uplinkDataKey:"X-Playback-Token",
+  xPaddingKey:"q",xPaddingBytes:"48-320",xPaddingMethod:"tokenish",xPaddingObfsMode:true,
+  xPaddingPlacement:"query",scMaxBufferedPosts:64,scMaxEachPostBytes:"1536-6144",
+  scMinPostsIntervalMs:"10-30",serverMaxHeaderBytes:32768
 }' "$TMP/yandex/host-extra.json" >/dev/null
+! jq -e 'has("sessionKey") or has("sessionPlacement") or has("uplinkChunkSize") or (.xmux | has("maxConnections"))' "$TMP/yandex/host-extra.json" >/dev/null
 
 jq -e '. == {
   xPaddingKey:"_dc",xPaddingHeader:"X-Cache",xPaddingMethod:"tokenish",uplinkHTTPMethod:"GET",
@@ -67,4 +69,4 @@ jq -e '. == {
   downloadHTTPMethod:"GET",uplinkDataPlacement:"body",scMaxBufferedPosts:100,scMaxEachPostBytes:3000000,
   scMaxConcurrentPosts:10,scMinPostsIntervalMs:"5-10",serverMaxHeaderBytes:32768
 }' "$TMP/beeline/host-extra.json" >/dev/null
-printf 'PASS: Yandex query/header preset, unchanged VK/Beeline, matching server/client/Host Extra, preserved connection settings\n'
+printf 'PASS: Yandex path/query/header preset, canonical fields, unchanged VK/Beeline, matching server/client/Host Extra, preserved connection settings\n'

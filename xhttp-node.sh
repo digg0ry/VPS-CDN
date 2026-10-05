@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-SCRIPT_VERSION="2.3.3"
+SCRIPT_VERSION="2.3.4"
 STATE_DIR="/opt/xhttp-node"
 STATE_FILE="$STATE_DIR/state.env"
 WEBROOT="$STATE_DIR/www"
@@ -747,10 +747,14 @@ EOF
 write_nginx_logging() {
   install -d -m 755 "$NGINX_LOG_DIR" "$(dirname "$NGINX_LOG_FORMAT")" || return 1
   backup_file "$NGINX_LOG_FORMAT" >/dev/null || return 1
-  # Do not record query/session IDs, Referer padding, or User-Agent per packet.
+  # Do not record query, UUID session suffixes, Referer padding, or User-Agent.
   cat > "$NGINX_LOG_FORMAT" <<'EOF'
 # Managed by xhttp-node.sh: compact request logs, no query or Referer.
-log_format xhttp_node '$remote_addr [$time_local] "$request_method $uri" '
+map $uri $xhttp_node_log_uri {
+    default $uri;
+    "~^(?<xhttp_node_base>.+/)[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(/[^/]*)?/?$" $xhttp_node_base;
+}
+log_format xhttp_node '$remote_addr [$time_local] "$request_method $xhttp_node_log_uri" '
                      '$status $body_bytes_sent rt=$request_time '
                      'upstream=$upstream_status urt=$upstream_response_time';
 EOF
@@ -850,28 +854,37 @@ write_exports() {
   extra_file="$EXPORT_DIR/host-extra.json"
   case "$CDN_PROVIDER" in
     yandex)
+      # Match the reference node's effective framing, using canonical Xray keys.
+      # Session is in the URL path; sequence and padding are in the query.
       jq -n '{
         xmux: {
-          cMaxReuseTimes: "0",
-          maxConnections: "1",
-          hKeepAlivePeriod: 0,
-          hMaxRequestTimes: "0",
-          hMaxReusableSecs: "0"
+          cMaxReuseTimes: "128-256",
+          maxConcurrency: "8-16",
+          hKeepAlivePeriod: 30,
+          hMaxRequestTimes: "600-1000",
+          hMaxReusableSecs: "1800-3600"
         },
         seqKey: "offset",
+        headers: {
+          Accept: "application/vnd.api+json, application/json, text/plain, */*",
+          Pragma: "no-cache",
+          "Cache-Control": "no-cache",
+          "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
+        },
         seqPlacement: "query",
-        sessionIDKey: "auth",
-        sessionIDPlacement: "query",
-        sessionIDTable: "",
-        sessionIDLength: "16-32",
+        sessionIDKey: "media_sid",
+        sessionIDPlacement: "path",
         uplinkHTTPMethod: "GET",
         uplinkDataPlacement: "header",
         uplinkDataKey: "X-Playback-Token",
-        uplinkChunkSize: "2000-3000",
-        xPaddingBytes: "100-1000",
-        scMaxBufferedPosts: 100,
-        scMaxEachPostBytes: 8192,
-        scMinPostsIntervalMs: 30,
+        xPaddingKey: "q",
+        xPaddingBytes: "48-320",
+        xPaddingMethod: "tokenish",
+        xPaddingObfsMode: true,
+        xPaddingPlacement: "query",
+        scMaxBufferedPosts: 64,
+        scMaxEachPostBytes: "1536-6144",
+        scMinPostsIntervalMs: "10-30",
         serverMaxHeaderBytes: 32768
       }' > "$extra_file"
       ;;
@@ -901,6 +914,58 @@ write_exports() {
     '{provider:$provider,cdnDomain:$domain,originTarget:$origin,originProtocol:$protocol,originHostSni:$originHost,clientAddress:$clientAddress,path:$path,port:443}' \
     > "$EXPORT_DIR/connection-info.json"
   jq empty "$EXPORT_DIR/connection-info.json"
+}
+
+refresh_exports() {
+  require_root
+  load_state
+  [[ -s "$STATE_FILE" && -n "$DOMAIN" ]] || die "Chưa có setup; chọn Setup trước"
+  local current_path="$XHTTP_PATH"
+  check_inputs
+  XHTTP_PATH="$current_path"
+  local backup="" target="$EXPORT_DIR" staging
+  staging="$(mktemp -d "$STATE_DIR/.exports.XXXXXX")" || return 1
+  if [[ -d "$EXPORT_DIR" ]]; then
+    if ! install -d -m 700 "$BACKUP_ROOT" || \
+      ! backup="$(mktemp -d "$BACKUP_ROOT/exports-$(date +%Y%m%d-%H%M%S).XXXXXX")" || \
+      ! cp -a "$EXPORT_DIR" "$backup/exports"; then
+      rm -rf -- "$staging"
+      return 1
+    fi
+  fi
+  EXPORT_DIR="$staging"
+  if ! write_exports || ! jq empty "$staging/host-extra.json" "$staging/server-inbound.json" \
+    "$staging/client-template.json" "$staging/host-config.json" "$staging/connection-info.json" || \
+    ! jq -e -n --slurpfile extra "$staging/host-extra.json" \
+      --slurpfile server "$staging/server-inbound.json" --slurpfile client "$staging/client-template.json" \
+      --slurpfile host "$staging/host-config.json" --arg path "$XHTTP_PATH" --argjson port "$XHTTP_PORT" '
+        ($extra | length == 1) and ($extra[0] | type == "object") and
+        ($server[0].inbounds[0].streamSettings.xhttpSettings.extra == $extra[0]) and
+        ($client[0].outbounds[0].streamSettings.xhttpSettings.extra == $extra[0]) and
+        ($host[0].extra == $extra[0]) and ($host[0].path == $path) and
+        ($server[0].inbounds[0].port == $port) and
+        ($server[0].inbounds[0].streamSettings.xhttpSettings.path == $path)
+      ' >/dev/null; then
+    EXPORT_DIR="$target"
+    rm -rf -- "$staging"
+    warn "Xuất JSON thất bại; giữ exports cũ."
+    return 1
+  fi
+  EXPORT_DIR="$target"
+  if ! install -d -m 700 "$target" || ! cp -a "$staging/." "$target/"; then
+    if [[ -n "$backup" ]]; then
+      cp -a "$backup/exports/." "$target/" || return 1
+    fi
+    rm -rf -- "$staging"
+    warn "Xuất JSON thất bại; đã giữ lại bản cũ."
+    return 1
+  fi
+  rm -rf -- "$staging"
+  [[ -z "$backup" ]] || log "Backup exports: $backup"
+  log "Đã xuất JSON theo preset $CDN_PROVIDER của v$SCRIPT_VERSION; giữ domain/path/port/cert và dịch vụ đang chạy."
+  printf 'Host Extra: %s\nServer inbound: %s\nClient template: %s\n' \
+    "$EXPORT_DIR/host-extra.json" "$EXPORT_DIR/server-inbound.json" "$EXPORT_DIR/client-template.json"
+  warn "Chưa thay config trên panel. Cập nhật inbound và Host Extra cùng lúc, rồi refresh subscription/profile client."
 }
 
 check_dns() {
@@ -1226,7 +1291,7 @@ print_menu() {
       3) change_domain_path; break ;;
       4) check_status; break ;;
       5) check_files; break ;;
-      6) load_state; cat "$EXPORT_DIR/host-extra.json" 2>/dev/null || warn "Chưa có Host Extra"; break ;;
+      6) refresh_exports; cat "$EXPORT_DIR/host-extra.json"; break ;;
       7) require_root; load_state; write_watchdog; log "Watchdog: RAM ${RAM_THRESHOLD}%, mỗi phút, cooldown ${COOLDOWN}s, chỉ restart remnanode"; break ;;
       8) web_template_menu; break ;;
       9) remove_cdn_managed; break ;;
